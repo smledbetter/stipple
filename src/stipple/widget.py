@@ -210,9 +210,8 @@ class Stipple(anywidget.AnyWidget):
             "bbox": (xmin, xmax, ymin, ymax),
             "n": n,
         }
-        # Cache palette size + kind so update_color() can re-quantize
-        # against the fixed GPU palette without going through
-        # resolve_palette again.
+        # The GPU palette is immutable after init; cache its size + kind
+        # so update_color() doesn't need to re-resolve.
         self._palette_n = int(palette_rgba.shape[0])
         self._color_kind = kind
         self.n_points = n
@@ -340,10 +339,13 @@ class Stipple(anywidget.AnyWidget):
         self._gen_counter += 1
         gen = self._gen_counter
 
+        # memoryview avoids a 16 MB+ copy that .tobytes() would force per
+        # chunk; ipywidgets serializes memoryview straight onto the
+        # comm's binary side-channel.
         if n <= self._CHUNK_THRESHOLD:
             self.send(
                 {"type": "color_update", "gen": gen, "n": n},
-                buffers=[codes.tobytes()],
+                buffers=[memoryview(codes)],
             )
             return
 
@@ -363,7 +365,7 @@ class Stipple(anywidget.AnyWidget):
             b = min(a + chunk_n, n)
             self.send(
                 {"type": "color_update_chunk", "gen": gen, "i": i, "a": a},
-                buffers=[codes[a:b].tobytes()],
+                buffers=[memoryview(codes[a:b])],
             )
         self.send({"type": "color_update_finalize", "gen": gen})
 
@@ -484,12 +486,26 @@ def _quantize_continuous(
     """Min/max-normalize ``arr`` and quantize to uint32 palette indices.
 
     Returns ``(codes, lo, hi)`` so the caller can sync the color range
-    trait. NaN/inf values are clamped to 0 (palette's first slot).
+    trait. NaN values are ignored when computing min/max; +/- inf is
+    treated as a valid extreme.
     """
-    v = arr.astype(np.float32)
-    finite = v[np.isfinite(v)]
-    lo = float(vmin) if vmin is not None else (float(finite.min()) if finite.size else 0.0)
-    hi = float(vmax) if vmax is not None else (float(finite.max()) if finite.size else 1.0)
+    v = arr.astype(np.float32) if arr.dtype != np.float32 else arr
+    # nanmin/nanmax are one-pass; the prior `v[np.isfinite(v)]` filter
+    # allocated a fresh ~40 MB copy at 10M points just to find min/max.
+    if vmin is not None:
+        lo = float(vmin)
+    else:
+        try:
+            lo = float(np.nanmin(v))
+        except ValueError:
+            lo = 0.0
+    if vmax is not None:
+        hi = float(vmax)
+    else:
+        try:
+            hi = float(np.nanmax(v))
+        except ValueError:
+            hi = 1.0
     span = max(hi - lo, 1e-12)
     normalized = np.clip((v - lo) / span, 0.0, 1.0)
     codes = np.clip(

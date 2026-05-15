@@ -102,6 +102,11 @@ function bufferToBytes(buf: ArrayBuffer | ArrayBufferView): Uint8Array {
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 
+function bufferToUint32(buf: ArrayBuffer | ArrayBufferView): Uint32Array {
+  const bytes = bufferToBytes(buf);
+  return new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+}
+
 async function getAdapterInfo(adapter: GPUAdapter): Promise<string> {
   let info: Partial<GPUAdapterInfo> = {};
   try {
@@ -1313,7 +1318,6 @@ export default {
     // in stale colors.
     let colorUpdateStream: {
       gen: number;
-      n: number;
       codes: Uint32Array;
       chunksRemaining: number;
     } | null = null;
@@ -1740,13 +1744,7 @@ export default {
         if (m.gen < latestColorGen) return;  // stale relative to in-flight chunked update
         latestColorGen = m.gen;
         if (!buffers || buffers.length === 0) return;
-        const bytes = bufferToBytes(buffers[0]);
-        const codes = new Uint32Array(
-          bytes.buffer,
-          bytes.byteOffset,
-          bytes.byteLength / 4,
-        );
-        writeBuf(state.colorBuf, 0, codes);
+        writeBuf(state.colorBuf, 0, bufferToUint32(buffers[0]));
         requestRender();
         return;
       }
@@ -1755,7 +1753,6 @@ export default {
         if (m.gen < latestColorGen) return;
         colorUpdateStream = {
           gen: m.gen,
-          n: m.n,
           codes: new Uint32Array(m.n),
           chunksRemaining: m.n_chunks,
         };
@@ -1771,13 +1768,7 @@ export default {
         ) {
           return;
         }
-        const bytes = bufferToBytes(buffers[0]);
-        const chunk = new Uint32Array(
-          bytes.buffer,
-          bytes.byteOffset,
-          bytes.byteLength / 4,
-        );
-        colorUpdateStream.codes.set(chunk, m.a);
+        colorUpdateStream.codes.set(bufferToUint32(buffers[0]), m.a);
         colorUpdateStream.chunksRemaining -= 1;
         return;
       }

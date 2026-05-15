@@ -11231,6 +11231,10 @@ function bufferToBytes(buf) {
   if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
+function bufferToUint32(buf) {
+  const bytes = bufferToBytes(buf);
+  return new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+}
 async function getAdapterInfo(adapter) {
   let info = {};
   try {
@@ -12507,13 +12511,7 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
         if (m.gen < latestColorGen) return;
         latestColorGen = m.gen;
         if (!buffers || buffers.length === 0) return;
-        const bytes = bufferToBytes(buffers[0]);
-        const codes = new Uint32Array(
-          bytes.buffer,
-          bytes.byteOffset,
-          bytes.byteLength / 4
-        );
-        writeBuf(state.colorBuf, 0, codes);
+        writeBuf(state.colorBuf, 0, bufferToUint32(buffers[0]));
         requestRender();
         return;
       }
@@ -12522,7 +12520,6 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
         if (m.gen < latestColorGen) return;
         colorUpdateStream = {
           gen: m.gen,
-          n: m.n,
           codes: new Uint32Array(m.n),
           chunksRemaining: m.n_chunks
         };
@@ -12533,13 +12530,7 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
         if (!colorUpdateStream || colorUpdateStream.gen !== m.gen || !buffers || buffers.length === 0) {
           return;
         }
-        const bytes = bufferToBytes(buffers[0]);
-        const chunk = new Uint32Array(
-          bytes.buffer,
-          bytes.byteOffset,
-          bytes.byteLength / 4
-        );
-        colorUpdateStream.codes.set(chunk, m.a);
+        colorUpdateStream.codes.set(bufferToUint32(buffers[0]), m.a);
         colorUpdateStream.chunksRemaining -= 1;
         return;
       }
