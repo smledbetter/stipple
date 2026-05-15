@@ -199,8 +199,8 @@ is why a recolor at 10 M points is sub-frame.
 
 ## Status
 
-Pre-1.0 (v0.1.0.dev0). The render path, lasso, chunked transport, runtime
-recolor, and DataFrame ingest are all green at the smoke gates in
+v0.1.0 — first public release. The render path, lasso, chunked transport,
+runtime recolor, and DataFrame ingest are all green at the smoke gates in
 [`examples/`](examples/). The API is unlikely to change shape but trait names
 and keyword arguments may be refined before 1.0. Bug reports welcome on the
 issue tracker.
