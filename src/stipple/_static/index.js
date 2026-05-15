@@ -11929,13 +11929,34 @@ const index = {
       };
       burst();
       const out = new Uint32Array(slice);
-      model.send({ type: "selection", ms, count }, void 0, [out.buffer]);
+      const SEL_CHUNK_BYTES = 4 * 1024 * 1024;
+      if (out.byteLength <= SEL_CHUNK_BYTES) {
+        model.send({ type: "selection", ms, count }, void 0, [out.buffer]);
+      } else {
+        const u32PerChunk = SEL_CHUNK_BYTES / 4;
+        const nChunks = Math.ceil(count / u32PerChunk);
+        selGenCounter += 1;
+        const gen = selGenCounter;
+        model.send(
+          { type: "selection_start", gen, ms, count, n_chunks: nChunks },
+          void 0,
+          []
+        );
+        for (let i = 0; i < nChunks; i++) {
+          const a = i * u32PerChunk;
+          const b = Math.min(a + u32PerChunk, count);
+          const chunkBuf = out.buffer.slice(a * 4, b * 4);
+          model.send({ type: "selection_chunk", gen, i }, void 0, [chunkBuf]);
+        }
+        model.send({ type: "selection_finalize", gen }, void 0, []);
+      }
       log(
         `✓ lasso: ${count.toLocaleString()} / ${state.n.toLocaleString()} selected · ${ms.toFixed(1)} ms · awaiting Python ack…
 (shift+drag to lasso · plain drag to pan · wheel to zoom · re-run the next cell to inspect)`
       );
       pendingAck = { count, ms };
     }
+    let selGenCounter = 0;
     model.on("change:render_mode", () => {
       if (!state) return;
       tooltip.style.display = "none";

@@ -991,9 +991,36 @@ export default {
       };
       burst();
 
-      // Send to Python. Copy into a fresh ArrayBuffer to ensure ownership.
-      const out = new Uint32Array(slice);
-      model.send({ type: "selection", ms, count }, undefined, [out.buffer]);
+      // Send the selection indices to Python. The ipywidget comm channel
+      // sits on a JupyterLab websocket with a default 10 MiB max-message-
+      // size — selections above ~2.6M indices (10.4 MB) drop silently.
+      // We chunk anything larger into 4 MiB pieces and reassemble Python-
+      // side. Small selections still use the single-shot path.
+      const out = new Uint32Array(slice); // fresh-buffer copy for ownership
+      const SEL_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB
+      if (out.byteLength <= SEL_CHUNK_BYTES) {
+        model.send({ type: "selection", ms, count }, undefined, [out.buffer]);
+      } else {
+        const u32PerChunk = SEL_CHUNK_BYTES / 4;
+        const nChunks = Math.ceil(count / u32PerChunk);
+        selGenCounter += 1;
+        const gen = selGenCounter;
+        model.send(
+          { type: "selection_start", gen, ms, count, n_chunks: nChunks },
+          undefined,
+          [],
+        );
+        for (let i = 0; i < nChunks; i++) {
+          const a = i * u32PerChunk;
+          const b = Math.min(a + u32PerChunk, count);
+          // ArrayBuffer.slice copies — necessary so each chunk has its own
+          // backing buffer and the comm serializer doesn't try to ship the
+          // full underlying 40 MB region for every message.
+          const chunkBuf = out.buffer.slice(a * 4, b * 4);
+          model.send({ type: "selection_chunk", gen, i }, undefined, [chunkBuf]);
+        }
+        model.send({ type: "selection_finalize", gen }, undefined, []);
+      }
 
       log(
         `✓ lasso: ${count.toLocaleString()} / ${state.n.toLocaleString()} selected · ${ms.toFixed(1)} ms · awaiting Python ack…\n` +
@@ -1001,6 +1028,7 @@ export default {
       );
       pendingAck = { count, ms };
     }
+    let selGenCounter = 0;
 
     model.on("change:render_mode", () => {
       if (!state) return;

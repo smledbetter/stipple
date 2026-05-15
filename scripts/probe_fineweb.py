@@ -1,7 +1,7 @@
 """Demo verification — Lasso 10M FineWeb documents, read what's in your cluster.
 
 End-to-end test of the canonical ML researcher workflow on real data:
-  1. Load `examples/demo_fineweb_1m.ipynb` (10M FineWeb docs + text blob)
+  1. Load `examples/demo_fineweb_10m.ipynb` (10M FineWeb docs + text blob)
   2. Wait for the density render to complete (chunked transport, ~25 chunks)
   3. Shift+drag a lasso around the center of the embedding
   4. Re-run the inspect cell
@@ -26,7 +26,7 @@ from playwright.sync_api import sync_playwright
 
 REPO = Path(__file__).resolve().parent.parent
 TOKEN = "stipple-fineweb-token"
-NOTEBOOK = "examples/demo_fineweb_1m.ipynb"
+NOTEBOOK = "examples/demo_fineweb_10m.ipynb"
 
 
 def find_free_port(start: int = 9110) -> int:

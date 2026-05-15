@@ -289,17 +289,57 @@ class Stipple(anywidget.AnyWidget):
         self.send({"type": "data_finalize", "gen": gen})
 
     def _on_custom_msg(self, _widget: Any, content: dict[str, Any], buffers: list) -> None:
-        if content.get("type") != "selection":
+        msg_type = content.get("type")
+        if msg_type == "selection":
+            # Single-shot path: small enough to fit in one comm message.
+            if not buffers:
+                self._selected_indices = np.empty(0, dtype=np.uint32)
+            else:
+                arr = self._buffer_to_uint32(buffers[0])
+                self._selected_indices = arr
+            self.selection_count = self.selection_count + 1
+            self.selection_ms = float(content.get("ms") or 0.0)
             return
-        if not buffers:
-            self._selected_indices = np.empty(0, dtype=np.uint32)
+
+        if msg_type == "selection_start":
+            self._sel_stream = {
+                "gen": content["gen"],
+                "ms": float(content.get("ms") or 0.0),
+                "count": int(content["count"]),
+                "n_chunks": int(content["n_chunks"]),
+                "chunks": [None] * int(content["n_chunks"]),
+            }
+            return
+
+        if msg_type == "selection_chunk":
+            s = getattr(self, "_sel_stream", None)
+            if s is None or s["gen"] != content["gen"] or not buffers:
+                return
+            s["chunks"][int(content["i"])] = self._buffer_to_uint32(buffers[0])
+            return
+
+        if msg_type == "selection_finalize":
+            s = getattr(self, "_sel_stream", None)
+            if s is None or s["gen"] != content["gen"]:
+                return
+            # Concatenate the per-chunk arrays. Missing chunks would raise,
+            # which is what we want — silently shrinking the selection would
+            # be a worse failure mode than an error.
+            if any(c is None for c in s["chunks"]):
+                self._sel_stream = None
+                return
+            self._selected_indices = np.concatenate(s["chunks"]).astype(np.uint32)
+            self.selection_count = self.selection_count + 1
+            self.selection_ms = s["ms"]
+            self._sel_stream = None
+
+    @staticmethod
+    def _buffer_to_uint32(buf: Any) -> np.ndarray:
+        if isinstance(buf, (bytes, bytearray)):
+            mv = buf
         else:
-            buf = buffers[0]
-            mv = memoryview(buf).tobytes() if not isinstance(buf, (bytes, bytearray)) else buf
-            arr = np.frombuffer(mv, dtype=np.uint32).copy()
-            self._selected_indices = arr
-        self.selection_count = self.selection_count + 1
-        self.selection_ms = float(content.get("ms") or 0.0)
+            mv = memoryview(buf).tobytes()
+        return np.frombuffer(mv, dtype=np.uint32).copy()
 
 
 def _extract_columns(
