@@ -10839,9 +10839,12 @@ fn point_in_poly(p: vec2f) -> bool {
   return inside;
 }
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let idx = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let idx = gid.x + gid.y * (ng.x * 256u);
   if (idx >= lu.n_points) { return; }
   let p = positions[idx];
   if (point_in_poly(p)) {
@@ -10860,9 +10863,12 @@ struct ClearUniforms { n: u32, _p0: u32, _p1: u32, _p2: u32 };
 @group(0) @binding(0) var<storage, read_write> mask: array<u32>;
 @group(0) @binding(1) var<uniform> cu: ClearUniforms;
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
   if (i >= cu.n) { return; }
   mask[i] = 0u;
 }
@@ -10891,9 +10897,12 @@ fn cell_of(p: vec2f) -> u32 {
   return cy * gu.cell_n + cx;
 }
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
   if (i >= gu.n_points) { return; }
   atomicAdd(&cell_count[cell_of(positions[i])], 1u);
 }
@@ -10924,9 +10933,12 @@ fn cell_of(p: vec2f) -> u32 {
   return cy * gu.cell_n + cx;
 }
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
   if (i >= gu.n_points) { return; }
   let c = cell_of(positions[i]);
   let off = atomicAdd(&cell_cursor[c], 1u);
@@ -11023,6 +11035,100 @@ fn cs(@builtin(local_invocation_id) lid: vec3u) {
 `
 );
 const HOVER_GRID_CELL_N = 256;
+const DENSITY_BUILD_WGSL = (
+  /* wgsl */
+  `
+struct DensityUniforms {
+  n_points: u32,
+  bin_n: u32,
+  _p0: u32,
+  _p1: u32,
+  origin: vec2f,
+  inv_cell: vec2f,
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec2f>;
+@group(0) @binding(1) var<storage, read_write> bin_count: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> du: DensityUniforms;
+
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
+  if (i >= du.n_points) { return; }
+  let p = positions[i];
+  let f = (p - du.origin) * du.inv_cell;
+  let bn = f32(du.bin_n);
+  let cx = u32(clamp(f.x, 0.0, bn - 1.0));
+  let cy = u32(clamp(f.y, 0.0, bn - 1.0));
+  atomicAdd(&bin_count[cy * du.bin_n + cx], 1u);
+}
+`
+);
+const DENSITY_RENDER_WGSL = (
+  /* wgsl */
+  `
+struct RenderUniforms {
+  viewport: vec2f,
+  bin_n: u32,
+  log_max: f32,
+  view_translate: vec2f,
+  view_scale: vec2f,
+  origin: vec2f,
+  inv_cell: vec2f,
+  palette_n: u32,
+  _p0: u32,
+  _p1: u32,
+  _p2: u32,
+};
+
+@group(0) @binding(0) var<uniform> u: RenderUniforms;
+@group(0) @binding(1) var<storage, read> bin_count: array<u32>;
+@group(0) @binding(2) var<storage, read> palette: array<vec4f>;
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
+  // Oversized triangle covering the viewport — the clip stage trims it.
+  var pos = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  return vec4f(pos[vid], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
+  // Pixel → clip (WebGPU fragment Y is top-down; clip Y is bottom-up).
+  let clip_x = (frag_coord.x / u.viewport.x) * 2.0 - 1.0;
+  let clip_y = 1.0 - (frag_coord.y / u.viewport.y) * 2.0;
+  // Clip → world.
+  let wx = clip_x / u.view_scale.x + u.view_translate.x;
+  let wy = clip_y / u.view_scale.y + u.view_translate.y;
+  // World → bin.
+  let fx = (wx - u.origin.x) * u.inv_cell.x;
+  let fy = (wy - u.origin.y) * u.inv_cell.y;
+  let bn_f = f32(u.bin_n);
+  if (fx < 0.0 || fy < 0.0 || fx >= bn_f || fy >= bn_f) {
+    discard;
+  }
+  let bx = u32(fx);
+  let by = u32(fy);
+  let count = bin_count[by * u.bin_n + bx];
+  if (count == 0u) {
+    discard;
+  }
+  let t = log(f32(count) + 1.0) / max(u.log_max, 1e-6);
+  let pn = max(1u, u.palette_n);
+  let idx = u32(clamp(t * f32(pn - 1u), 0.0, f32(pn - 1u)));
+  let rgb = palette[idx].rgb;
+  return vec4f(rgb, 1.0);
+}
+`
+);
+const DENSITY_BIN_N = 1024;
 
 function makeStatusEl() {
   const el = document.createElement("div");
@@ -11138,7 +11244,13 @@ const index = {
       return;
     }
     const adapterInfo = await getAdapterInfo(adapter);
-    const device = await adapter.requestDevice();
+    const aLimits = adapter.limits;
+    const device = await adapter.requestDevice({
+      requiredLimits: {
+        maxStorageBufferBindingSize: aLimits.maxStorageBufferBindingSize,
+        maxBufferSize: aLimits.maxBufferSize
+      }
+    });
     const ctx = gpuCanvas.getContext("webgpu");
     if (!ctx) {
       fail("configure-error", "getContext('webgpu') returned null", "no webgpu context");
@@ -11147,6 +11259,18 @@ const index = {
     const format = navigator.gpu.getPreferredCanvasFormat();
     ctx.configure({ device, format, alphaMode: "premultiplied" });
     const writeBuf = (buf, offset, data) => device.queue.writeBuffer(buf, offset, data);
+    const MAX_DISPATCH_DIM = 65535;
+    const BULK_WG = 256;
+    function dispatchN(pass, n) {
+      const groups = Math.ceil(n / BULK_WG);
+      if (groups <= MAX_DISPATCH_DIM) {
+        pass.dispatchWorkgroups(groups);
+      } else {
+        const gx = MAX_DISPATCH_DIM;
+        const gy = Math.ceil(groups / MAX_DISPATCH_DIM);
+        pass.dispatchWorkgroups(gx, gy);
+      }
+    }
     const renderShader = device.createShaderModule({ code: SCATTER_WGSL });
     const renderPipeline = device.createRenderPipeline({
       layout: "auto",
@@ -11209,6 +11333,30 @@ const index = {
     });
     const CELL_N = HOVER_GRID_CELL_N;
     const CELL_TOTAL = CELL_N * CELL_N;
+    const BIN_N = DENSITY_BIN_N;
+    const BIN_TOTAL = BIN_N * BIN_N;
+    const densityBuildShader = device.createShaderModule({ code: DENSITY_BUILD_WGSL });
+    const densityBuildPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: densityBuildShader, entryPoint: "cs" }
+    });
+    const densityRenderShader = device.createShaderModule({ code: DENSITY_RENDER_WGSL });
+    const densityRenderPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: densityRenderShader, entryPoint: "vs" },
+      fragment: {
+        module: densityRenderShader,
+        entryPoint: "fs",
+        targets: [{ format }]
+      },
+      primitive: { topology: "triangle-list" }
+    });
+    const densityRenderUbo = device.createBuffer({
+      // viewport(8) + bin_n(4) + log_max(4) + view_translate(8) + view_scale(8)
+      // + origin(8) + inv_cell(8) + palette_n(4) + pad(12) = 64 bytes.
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
     const queryOut = device.createBuffer({
       size: 8,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
@@ -11328,6 +11476,18 @@ const index = {
           { binding: 5, resource: { buffer: queryOut } }
         ]
       });
+      const binCountBuf = device.createBuffer({
+        size: BIN_TOTAL * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+      });
+      const densityRenderBindGroup = device.createBindGroup({
+        layout: densityRenderPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: densityRenderUbo } },
+          { binding: 1, resource: { buffer: binCountBuf } },
+          { binding: 2, resource: { buffer: paletteBuf } }
+        ]
+      });
       return {
         n,
         posBuf,
@@ -11354,7 +11514,14 @@ const index = {
         cellStartBuf,
         cellCountBuf,
         pointIdsBuf,
-        hoverQueryBindGroup
+        hoverQueryBindGroup,
+        densityReady: false,
+        densityOrigin: [0, 0],
+        densityInvCell: [1, 1],
+        binCountBuf,
+        densityRenderBindGroup,
+        densityLogMax: 1,
+        mode: "scatter"
       };
     }
     async function buildHoverGrid(s) {
@@ -11414,7 +11581,7 @@ const index = {
       const pass1 = enc1.beginComputePass();
       pass1.setPipeline(gridCountPipeline);
       pass1.setBindGroup(0, countBindGroup);
-      pass1.dispatchWorkgroups(Math.ceil(s.n / 64));
+      dispatchN(pass1, s.n);
       pass1.end();
       enc1.copyBufferToBuffer(s.cellCountBuf, 0, cellCountStaging, 0, CELL_TOTAL * 4);
       device.queue.submit([enc1.finish()]);
@@ -11443,12 +11610,80 @@ const index = {
       const pass2 = enc2.beginComputePass();
       pass2.setPipeline(gridScatterPipeline);
       pass2.setBindGroup(0, scatterBindGroup);
-      pass2.dispatchWorkgroups(Math.ceil(s.n / 64));
+      dispatchN(pass2, s.n);
       pass2.end();
       device.queue.submit([enc2.finish()]);
       cellCursorBuf.destroy();
       gridUbo.destroy();
       s.gridReady = true;
+    }
+    async function buildDensityGrid(s) {
+      let xMin = Infinity;
+      let xMax = -Infinity;
+      let yMin = Infinity;
+      let yMax = -Infinity;
+      const p = s.positionsCpu;
+      for (let i = 0; i < p.length; i += 2) {
+        const xi = p[i];
+        const yi = p[i + 1];
+        if (xi < xMin) xMin = xi;
+        if (xi > xMax) xMax = xi;
+        if (yi < yMin) yMin = yi;
+        if (yi > yMax) yMax = yi;
+      }
+      const padX = (xMax - xMin || 1) * 1e-4;
+      const padY = (yMax - yMin || 1) * 1e-4;
+      xMin -= padX;
+      xMax += padX;
+      yMin -= padY;
+      yMax += padY;
+      const cellW = (xMax - xMin) / BIN_N;
+      const cellH = (yMax - yMin) / BIN_N;
+      const invX = cellW > 0 ? 1 / cellW : 1;
+      const invY = cellH > 0 ? 1 / cellH : 1;
+      s.densityOrigin = [xMin, yMin];
+      s.densityInvCell = [invX, invY];
+      const buildUbo = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      const buildHeader = new ArrayBuffer(32);
+      new Uint32Array(buildHeader, 0, 4).set([s.n, BIN_N, 0, 0]);
+      new Float32Array(buildHeader, 16, 4).set([xMin, yMin, invX, invY]);
+      writeBuf(buildUbo, 0, new Uint8Array(buildHeader));
+      const zeros = new Uint32Array(BIN_TOTAL);
+      writeBuf(s.binCountBuf, 0, zeros);
+      const buildBindGroup = device.createBindGroup({
+        layout: densityBuildPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: s.posBuf } },
+          { binding: 1, resource: { buffer: s.binCountBuf } },
+          { binding: 2, resource: { buffer: buildUbo } }
+        ]
+      });
+      const staging = device.createBuffer({
+        size: BIN_TOTAL * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(densityBuildPipeline);
+      pass.setBindGroup(0, buildBindGroup);
+      dispatchN(pass, s.n);
+      pass.end();
+      enc.copyBufferToBuffer(s.binCountBuf, 0, staging, 0, BIN_TOTAL * 4);
+      device.queue.submit([enc.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const counts = new Uint32Array(staging.getMappedRange());
+      let maxC = 0;
+      for (let i = 0; i < counts.length; i++) {
+        if (counts[i] > maxC) maxC = counts[i];
+      }
+      staging.unmap();
+      staging.destroy();
+      buildUbo.destroy();
+      s.densityLogMax = Math.log(maxC + 1);
+      s.densityReady = true;
     }
     function fitView(positions, s) {
       let xMin = Infinity;
@@ -11473,25 +11708,19 @@ const index = {
       s.viewSx = margin / sx;
       s.viewSy = margin / sy;
     }
+    function activeRenderMode() {
+      if (!state) return "scatter";
+      if (state.mode === "density-only") return "density-only";
+      const requested = model.get("render_mode") || "scatter";
+      if (requested === "density-only") {
+        return state.densityReady ? "density" : "scatter";
+      }
+      if (requested === "density" && !state.densityReady) return "scatter";
+      return requested;
+    }
     function renderFrame() {
       if (!state) return;
-      const dim = Math.min(1, Math.max(0, model.get("selection_dim") ?? 0.4));
-      const data = new Float32Array([
-        gpuCanvas.width,
-        gpuCanvas.height,
-        state.pointSize,
-        state.paletteN,
-        state.viewTx,
-        state.viewTy,
-        state.viewSx,
-        state.viewSy,
-        dim,
-        state.hasSelection ? 1 : 0,
-        0,
-        0
-        // pad to 48-byte uniform buffer (16-aligned)
-      ]);
-      writeBuf(ubo, 0, data);
+      const mode = activeRenderMode();
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -11503,9 +11732,53 @@ const index = {
           }
         ]
       });
-      pass.setPipeline(renderPipeline);
-      pass.setBindGroup(0, state.bindGroup);
-      pass.draw(6, state.n);
+      if (mode === "density" || mode === "density-only") {
+        const header = new ArrayBuffer(64);
+        new Float32Array(header, 0, 2).set([gpuCanvas.width, gpuCanvas.height]);
+        new Uint32Array(header, 8, 1)[0] = BIN_N;
+        new Float32Array(header, 12, 1)[0] = state.densityLogMax;
+        new Float32Array(header, 16, 4).set([
+          state.viewTx,
+          state.viewTy,
+          state.viewSx,
+          state.viewSy
+        ]);
+        new Float32Array(header, 32, 4).set([
+          state.densityOrigin[0],
+          state.densityOrigin[1],
+          state.densityInvCell[0],
+          state.densityInvCell[1]
+        ]);
+        new Uint32Array(header, 48, 1)[0] = state.paletteN;
+        writeBuf(densityRenderUbo, 0, new Uint8Array(header));
+        pass.setPipeline(densityRenderPipeline);
+        pass.setBindGroup(0, state.densityRenderBindGroup);
+        pass.draw(3, 1);
+      } else {
+        const dim = Math.min(
+          1,
+          Math.max(0, model.get("selection_dim") ?? 0.4)
+        );
+        const data = new Float32Array([
+          gpuCanvas.width,
+          gpuCanvas.height,
+          state.pointSize,
+          state.paletteN,
+          state.viewTx,
+          state.viewTy,
+          state.viewSx,
+          state.viewSy,
+          dim,
+          state.hasSelection ? 1 : 0,
+          0,
+          0
+          // pad to 48-byte uniform buffer (16-aligned)
+        ]);
+        writeBuf(ubo, 0, data);
+        pass.setPipeline(renderPipeline);
+        pass.setBindGroup(0, state.bindGroup);
+        pass.draw(6, state.n);
+      }
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
@@ -11580,12 +11853,12 @@ const index = {
       const clearPass = encoder.beginComputePass();
       clearPass.setPipeline(maskClearPipeline);
       clearPass.setBindGroup(0, state.maskClearBindGroup);
-      clearPass.dispatchWorkgroups(Math.ceil(state.n / 64));
+      dispatchN(clearPass, state.n);
       clearPass.end();
       const pass = encoder.beginComputePass();
       pass.setPipeline(computePipeline);
       pass.setBindGroup(0, state.computeBindGroup);
-      pass.dispatchWorkgroups(Math.ceil(state.n / 64));
+      dispatchN(pass, state.n);
       pass.end();
       encoder.copyBufferToBuffer(counterBuf, 0, counterStaging, 0, 4);
       encoder.copyBufferToBuffer(state.outIndices, 0, state.outStaging, 0, state.n * 4);
@@ -11616,6 +11889,11 @@ const index = {
       );
       pendingAck = { count, ms };
     }
+    model.on("change:render_mode", () => {
+      if (!state) return;
+      tooltip.style.display = "none";
+      renderFrame();
+    });
     let pendingAck = null;
     model.on("change:selection_count", () => {
       if (!pendingAck || !state) return;
@@ -11633,6 +11911,7 @@ const index = {
       if (!state) return;
       gpuCanvas.setPointerCapture(e.pointerId);
       if (e.shiftKey) {
+        if (state.mode === "density-only") return;
         clearLassoOverlay();
         lassoMode = "drawing";
         const rect = gpuCanvas.getBoundingClientRect();
@@ -11701,6 +11980,11 @@ const index = {
     function queryHover(clientX, clientY) {
       if (!state || !state.gridReady) return;
       if (lassoMode !== "idle" || panning) return;
+      const m = activeRenderMode();
+      if (m === "density" || m === "density-only") {
+        hideTooltip();
+        return;
+      }
       const rect = gpuCanvas.getBoundingClientRect();
       const lx = clientX - rect.left;
       const ly = clientY - rect.top;
@@ -11819,11 +12103,279 @@ adapter: ${adapterInfo}`);
         requestAnimationFrame(tick);
       });
     }
+    let stream = null;
+    async function handleDataStart(msg, paletteBuffer) {
+      if (stream) {
+        stream.transientPosBuf?.destroy();
+        stream.densityBuildUbo?.destroy();
+        stream.binCountBuf?.destroy();
+        stream.paletteBuf?.destroy();
+        stream = null;
+      }
+      const palBytes = bufferToBytes(paletteBuffer);
+      const paletteRGBA = new Float32Array(
+        new Float32Array(
+          palBytes.buffer,
+          palBytes.byteOffset,
+          palBytes.byteLength / 4
+        )
+      );
+      stream = {
+        gen: msg.gen,
+        mode: msg.render_mode,
+        n: msg.n,
+        nChunks: msg.n_chunks,
+        chunkN: msg.chunk_n,
+        bbox: [msg.bbox[0], msg.bbox[1], msg.bbox[2], msg.bbox[3]],
+        received: 0,
+        paletteRGBA,
+        tStart: performance.now(),
+        bytesReceived: 0
+      };
+      if (msg.render_mode === "density-only") {
+        stream.transientPosBuf = device.createBuffer({
+          size: Math.max(8, msg.chunk_n * 8),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        stream.densityBuildUbo = device.createBuffer({
+          size: 32,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+        stream.binCountBuf = device.createBuffer({
+          size: BIN_TOTAL * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+        });
+        writeBuf(stream.binCountBuf, 0, new Uint32Array(BIN_TOTAL));
+        stream.paletteBuf = device.createBuffer({
+          size: paletteRGBA.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        writeBuf(stream.paletteBuf, 0, paletteRGBA);
+        stream.densityRenderBindGroup = device.createBindGroup({
+          layout: densityRenderPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: densityRenderUbo } },
+            { binding: 1, resource: { buffer: stream.binCountBuf } },
+            { binding: 2, resource: { buffer: stream.paletteBuf } }
+          ]
+        });
+        const [xMin, xMax, yMin, yMax] = stream.bbox;
+        const padX = (xMax - xMin || 1) * 1e-4;
+        const padY = (yMax - yMin || 1) * 1e-4;
+        const origin = [xMin - padX, yMin - padY];
+        const cellW = (xMax - xMin + 2 * padX) / BIN_N;
+        const cellH = (yMax - yMin + 2 * padY) / BIN_N;
+        const invCell = [
+          cellW > 0 ? 1 / cellW : 1,
+          cellH > 0 ? 1 / cellH : 1
+        ];
+        const stub = stream.transientPosBuf;
+        state = {
+          n: msg.n,
+          posBuf: stub,
+          colorBuf: stub,
+          paletteBuf: stream.paletteBuf,
+          paletteN: paletteRGBA.length / 4,
+          bindGroup: device.createBindGroup({
+            layout: renderPipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: ubo } },
+              { binding: 1, resource: { buffer: stub } },
+              { binding: 2, resource: { buffer: stub } },
+              { binding: 3, resource: { buffer: stream.paletteBuf } },
+              { binding: 4, resource: { buffer: stub } }
+            ]
+          }),
+          computeBindGroup: null,
+          maskClearBindGroup: null,
+          maskClearUbo: stub,
+          selectionMask: stub,
+          outIndices: stub,
+          outStaging: stub,
+          pointSize: 1.2,
+          viewTx: 0,
+          viewTy: 0,
+          viewSx: 1,
+          viewSy: 1,
+          hasSelection: false,
+          positionsCpu: new Float32Array(0),
+          gridReady: false,
+          gridOrigin: [0, 0],
+          gridInvCell: [1, 1],
+          cellStartBuf: stub,
+          cellCountBuf: stub,
+          pointIdsBuf: stub,
+          hoverQueryBindGroup: null,
+          densityReady: false,
+          // flipped at finalize
+          densityOrigin: origin,
+          densityInvCell: invCell,
+          binCountBuf: stream.binCountBuf,
+          densityRenderBindGroup: stream.densityRenderBindGroup,
+          densityLogMax: 1,
+          mode: "density-only"
+        };
+        const cx = (xMin + xMax) / 2;
+        const cy = (yMin + yMax) / 2;
+        const sx = xMax - xMin || 1;
+        const sy = yMax - yMin || 1;
+        const margin = 1.8;
+        state.viewTx = cx;
+        state.viewTy = cy;
+        state.viewSx = margin / sx;
+        state.viewSy = margin / sy;
+        const hdr = new ArrayBuffer(32);
+        new Uint32Array(hdr, 0, 4).set([0, BIN_N, 0, 0]);
+        new Float32Array(hdr, 16, 4).set([origin[0], origin[1], invCell[0], invCell[1]]);
+        writeBuf(stream.densityBuildUbo, 0, new Uint8Array(hdr));
+      } else {
+        stream.positions = new Float32Array(msg.n * 2);
+        stream.colorCodes = new Uint32Array(msg.n);
+      }
+      log(
+        `⏳ Stipple — loading 0 / ${msg.n_chunks} chunks · ${msg.n.toLocaleString()} rows · mode=${msg.render_mode}
+adapter: ${adapterInfo}`
+      );
+    }
+    async function handleDataChunk(msg, ipcBuffer) {
+      if (!stream || msg.gen !== stream.gen) return;
+      const ipcBytes = bufferToBytes(ipcBuffer);
+      stream.bytesReceived += ipcBytes.byteLength;
+      const table = tableFromIPC(ipcBytes);
+      const x = table.getChild("x").toArray();
+      const y = table.getChild("y").toArray();
+      const colorCol = table.getChild("color");
+      const chunkN = x.length;
+      const chunkPositions = new Float32Array(chunkN * 2);
+      for (let i = 0; i < chunkN; i++) {
+        chunkPositions[i * 2] = x[i];
+        chunkPositions[i * 2 + 1] = y[i];
+      }
+      let chunkCodes;
+      if (colorCol) {
+        const raw = colorCol.toArray();
+        chunkCodes = raw instanceof Uint32Array ? raw : new Uint32Array(raw);
+      } else {
+        chunkCodes = new Uint32Array(chunkN);
+      }
+      const offsetPoints = msg.i * stream.chunkN;
+      if (stream.mode === "density-only") {
+        writeBuf(stream.transientPosBuf, 0, chunkPositions);
+        writeBuf(stream.densityBuildUbo, 0, new Uint32Array([chunkN]));
+        const buildBindGroup = device.createBindGroup({
+          layout: densityBuildPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: stream.transientPosBuf } },
+            { binding: 1, resource: { buffer: stream.binCountBuf } },
+            { binding: 2, resource: { buffer: stream.densityBuildUbo } }
+          ]
+        });
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(densityBuildPipeline);
+        pass.setBindGroup(0, buildBindGroup);
+        dispatchN(pass, chunkN);
+        pass.end();
+        device.queue.submit([enc.finish()]);
+      } else {
+        stream.positions.set(chunkPositions, offsetPoints * 2);
+        stream.colorCodes.set(chunkCodes, offsetPoints);
+      }
+      stream.received += 1;
+      log(
+        `⏳ Stipple — loading ${stream.received} / ${stream.nChunks} chunks · ${stream.n.toLocaleString()} rows · mode=${stream.mode}`
+      );
+    }
+    async function handleDataFinalize(msg) {
+      if (!stream || msg.gen !== stream.gen) return;
+      const s = stream;
+      stream = null;
+      if (s.mode === "density-only") {
+        const staging = device.createBuffer({
+          size: BIN_TOTAL * 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(s.binCountBuf, 0, staging, 0, BIN_TOTAL * 4);
+        device.queue.submit([enc.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const counts = new Uint32Array(staging.getMappedRange());
+        let maxC = 0;
+        for (let i = 0; i < counts.length; i++) {
+          if (counts[i] > maxC) maxC = counts[i];
+        }
+        staging.unmap();
+        staging.destroy();
+        s.densityBuildUbo?.destroy();
+        s.transientPosBuf?.destroy();
+        state.densityLogMax = Math.log(maxC + 1);
+        state.densityReady = true;
+        renderFrame();
+      } else {
+        const positions = s.positions;
+        const colorCodes = s.colorCodes;
+        state = uploadState(positions, colorCodes, s.paletteRGBA);
+        state.mode = s.mode;
+        fitView(positions, state);
+        renderFrame();
+        if (s.mode === "scatter") {
+          void buildHoverGrid(state).catch((err) => {
+            console.warn("[stipple] hover grid build failed:", err);
+          });
+        }
+        void buildDensityGrid(state).then(() => {
+          if (state && state.mode === "density") renderFrame();
+        }).catch((err) => {
+          console.warn("[stipple] density grid build failed:", err);
+        });
+      }
+      const totalMs = (performance.now() - s.tStart).toFixed(0);
+      const mb = (s.bytesReceived / (1024 * 1024)).toFixed(2);
+      model.set("rows_received", s.n);
+      model.set("bytes_received", s.bytesReceived);
+      model.set("status", "data-rendered");
+      model.save_changes();
+      const { avgMs, fps } = await benchmarkFPS(30);
+      model.set("avg_frame_ms", avgMs);
+      model.set("last_fps", fps);
+      model.save_changes();
+      log(
+        `✓ Stipple — ${s.n.toLocaleString()} rows · mode=${s.mode}
+Arrow IPC: ${mb} MB across ${s.nChunks} chunks · ${totalMs} ms wall
+FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "density-only" ? "lasso + hover disabled (density-only)\n" : "shift+drag to lasso · drag to pan · wheel to zoom\n") + `adapter: ${adapterInfo}`
+      );
+    }
     model.on("msg:custom", (..._args) => {
       const args = _args;
       const msg = args[0];
       const buffers = args[1];
-      if (!msg || msg.type !== "data") return;
+      if (!msg) return;
+      if (msg.type === "data_start") {
+        if (!buffers || buffers.length === 0) {
+          fail("decode-error", "data_start without palette buffer", "no buffer");
+          return;
+        }
+        void handleDataStart(
+          msg,
+          buffers[0]
+        ).catch((e) => fail("decode-error", String(e), "data_start threw"));
+        return;
+      }
+      if (msg.type === "data_chunk") {
+        if (!buffers || buffers.length === 0) return;
+        void handleDataChunk(
+          msg,
+          buffers[0]
+        ).catch((e) => fail("decode-error", String(e), "data_chunk threw"));
+        return;
+      }
+      if (msg.type === "data_finalize") {
+        void handleDataFinalize(
+          msg
+        ).catch((e) => fail("decode-error", String(e), "data_finalize threw"));
+        return;
+      }
+      if (msg.type !== "data") return;
       if (!buffers || buffers.length === 0) {
         fail("decode-error", "data msg without buffer", "no buffer");
         return;
@@ -11876,6 +12428,11 @@ adapter: ${adapterInfo}`);
           const tRender = performance.now() - tUpload1;
           void buildHoverGrid(state).catch((err) => {
             console.warn("[stipple] hover grid build failed:", err);
+          });
+          void buildDensityGrid(state).then(() => {
+            if (model.get("render_mode") === "density") renderFrame();
+          }).catch((err) => {
+            console.warn("[stipple] density grid build failed:", err);
           });
           model.set("rows_received", n);
           model.set("bytes_received", bytes.byteLength);

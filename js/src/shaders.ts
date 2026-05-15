@@ -133,9 +133,12 @@ fn point_in_poly(p: vec2f) -> bool {
   return inside;
 }
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let idx = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let idx = gid.x + gid.y * (ng.x * 256u);
   if (idx >= lu.n_points) { return; }
   let p = positions[idx];
   if (point_in_poly(p)) {
@@ -154,9 +157,12 @@ struct ClearUniforms { n: u32, _p0: u32, _p1: u32, _p2: u32 };
 @group(0) @binding(0) var<storage, read_write> mask: array<u32>;
 @group(0) @binding(1) var<uniform> cu: ClearUniforms;
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
   if (i >= cu.n) { return; }
   mask[i] = 0u;
 }
@@ -188,9 +194,12 @@ fn cell_of(p: vec2f) -> u32 {
   return cy * gu.cell_n + cx;
 }
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
   if (i >= gu.n_points) { return; }
   atomicAdd(&cell_count[cell_of(positions[i])], 1u);
 }
@@ -219,9 +228,12 @@ fn cell_of(p: vec2f) -> u32 {
   return cy * gu.cell_n + cx;
 }
 
-@compute @workgroup_size(64)
-fn cs(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
   if (i >= gu.n_points) { return; }
   let c = cell_of(positions[i]);
   let off = atomicAdd(&cell_cursor[c], 1u);
@@ -319,3 +331,100 @@ fn cs(@builtin(local_invocation_id) lid: vec3u) {
 `;
 
 export const HOVER_GRID_CELL_N = 256;
+
+// RasterScan density primitive. Build pass: one thread per point, atomicAdd
+// into the bin's slot in a CELL_N × CELL_N grid (default 1024² = 1M bins).
+// Render pass: full-screen triangle, fragment back-projects pixel → world →
+// bin, samples the bin count, runs a log color map through the palette LUT.
+// Frame cost scales with rendered pixels (≤ canvas size), not with N.
+
+export const DENSITY_BUILD_WGSL = /* wgsl */ `
+struct DensityUniforms {
+  n_points: u32,
+  bin_n: u32,
+  _p0: u32,
+  _p1: u32,
+  origin: vec2f,
+  inv_cell: vec2f,
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec2f>;
+@group(0) @binding(1) var<storage, read_write> bin_count: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> du: DensityUniforms;
+
+@compute @workgroup_size(256)
+fn cs(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) ng: vec3u,
+) {
+  let i = gid.x + gid.y * (ng.x * 256u);
+  if (i >= du.n_points) { return; }
+  let p = positions[i];
+  let f = (p - du.origin) * du.inv_cell;
+  let bn = f32(du.bin_n);
+  let cx = u32(clamp(f.x, 0.0, bn - 1.0));
+  let cy = u32(clamp(f.y, 0.0, bn - 1.0));
+  atomicAdd(&bin_count[cy * du.bin_n + cx], 1u);
+}
+`;
+
+export const DENSITY_RENDER_WGSL = /* wgsl */ `
+struct RenderUniforms {
+  viewport: vec2f,
+  bin_n: u32,
+  log_max: f32,
+  view_translate: vec2f,
+  view_scale: vec2f,
+  origin: vec2f,
+  inv_cell: vec2f,
+  palette_n: u32,
+  _p0: u32,
+  _p1: u32,
+  _p2: u32,
+};
+
+@group(0) @binding(0) var<uniform> u: RenderUniforms;
+@group(0) @binding(1) var<storage, read> bin_count: array<u32>;
+@group(0) @binding(2) var<storage, read> palette: array<vec4f>;
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
+  // Oversized triangle covering the viewport — the clip stage trims it.
+  var pos = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  return vec4f(pos[vid], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
+  // Pixel → clip (WebGPU fragment Y is top-down; clip Y is bottom-up).
+  let clip_x = (frag_coord.x / u.viewport.x) * 2.0 - 1.0;
+  let clip_y = 1.0 - (frag_coord.y / u.viewport.y) * 2.0;
+  // Clip → world.
+  let wx = clip_x / u.view_scale.x + u.view_translate.x;
+  let wy = clip_y / u.view_scale.y + u.view_translate.y;
+  // World → bin.
+  let fx = (wx - u.origin.x) * u.inv_cell.x;
+  let fy = (wy - u.origin.y) * u.inv_cell.y;
+  let bn_f = f32(u.bin_n);
+  if (fx < 0.0 || fy < 0.0 || fx >= bn_f || fy >= bn_f) {
+    discard;
+  }
+  let bx = u32(fx);
+  let by = u32(fy);
+  let count = bin_count[by * u.bin_n + bx];
+  if (count == 0u) {
+    discard;
+  }
+  let t = log(f32(count) + 1.0) / max(u.log_max, 1e-6);
+  let pn = max(1u, u.palette_n);
+  let idx = u32(clamp(t * f32(pn - 1u), 0.0, f32(pn - 1u)));
+  let rgb = palette[idx].rgb;
+  return vec4f(rgb, 1.0);
+}
+`;
+
+export const DENSITY_BIN_N = 1024;

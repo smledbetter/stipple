@@ -7,6 +7,9 @@ import {
   GRID_SCATTER_WGSL,
   HOVER_QUERY_WGSL,
   HOVER_GRID_CELL_N,
+  DENSITY_BUILD_WGSL,
+  DENSITY_RENDER_WGSL,
+  DENSITY_BIN_N,
   BRAND_BLUE,
 } from "./shaders";
 
@@ -165,7 +168,17 @@ export default {
       return;
     }
     const adapterInfo = await getAdapterInfo(adapter);
-    const device = await adapter.requestDevice();
+    // Opt into the adapter's maxima for storage-buffer + total-buffer size.
+    // Default limits cap storage bindings at 128 MiB and total buffer size
+    // at 256 MiB — both are hit well below 25M points. We cap requested
+    // values to whatever the adapter actually supports.
+    const aLimits = adapter.limits;
+    const device = await adapter.requestDevice({
+      requiredLimits: {
+        maxStorageBufferBindingSize: aLimits.maxStorageBufferBindingSize,
+        maxBufferSize: aLimits.maxBufferSize,
+      },
+    });
 
     const ctx = gpuCanvas.getContext("webgpu");
     if (!ctx) {
@@ -177,6 +190,23 @@ export default {
 
     const writeBuf = (buf: GPUBuffer, offset: number, data: ArrayBufferView) =>
       device.queue.writeBuffer(buf, offset, data as unknown as ArrayBuffer);
+
+    // dispatchWorkgroups is capped at 65535 per dimension. For bulk-scan
+    // kernels (workgroup_size 256), 1D dispatch tops out at ~16.8M threads.
+    // Use 2D dispatch beyond that — shaders compute the flat index from
+    // (gid.x + gid.y * num_workgroups.x * 256u).
+    const MAX_DISPATCH_DIM = 65535;
+    const BULK_WG = 256;
+    function dispatchN(pass: GPUComputePassEncoder, n: number) {
+      const groups = Math.ceil(n / BULK_WG);
+      if (groups <= MAX_DISPATCH_DIM) {
+        pass.dispatchWorkgroups(groups);
+      } else {
+        const gx = MAX_DISPATCH_DIM;
+        const gy = Math.ceil(groups / MAX_DISPATCH_DIM);
+        pass.dispatchWorkgroups(gx, gy);
+      }
+    }
 
     // -------- Render pipeline --------
     const renderShader = device.createShaderModule({ code: SCATTER_WGSL });
@@ -250,6 +280,32 @@ export default {
 
     const CELL_N = HOVER_GRID_CELL_N;
     const CELL_TOTAL = CELL_N * CELL_N;
+    const BIN_N = DENSITY_BIN_N;
+    const BIN_TOTAL = BIN_N * BIN_N;
+
+    // -------- Density-mode compute + render pipelines --------
+    const densityBuildShader = device.createShaderModule({ code: DENSITY_BUILD_WGSL });
+    const densityBuildPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: densityBuildShader, entryPoint: "cs" },
+    });
+    const densityRenderShader = device.createShaderModule({ code: DENSITY_RENDER_WGSL });
+    const densityRenderPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: densityRenderShader, entryPoint: "vs" },
+      fragment: {
+        module: densityRenderShader,
+        entryPoint: "fs",
+        targets: [{ format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    const densityRenderUbo = device.createBuffer({
+      // viewport(8) + bin_n(4) + log_max(4) + view_translate(8) + view_scale(8)
+      // + origin(8) + inv_cell(8) + palette_n(4) + pad(12) = 64 bytes.
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
     // Reusable buffers for hover-query result (8 bytes: dist² u32, idx u32).
     const queryOut = device.createBuffer({
       size: 8,
@@ -311,6 +367,17 @@ export default {
       cellCountBuf: GPUBuffer;
       pointIdsBuf: GPUBuffer;
       hoverQueryBindGroup: GPUBindGroup;
+      // Density mode (built async via buildDensityGrid)
+      densityReady: boolean;
+      densityOrigin: [number, number];
+      densityInvCell: [number, number];
+      binCountBuf: GPUBuffer;
+      densityRenderBindGroup: GPUBindGroup;
+      densityLogMax: number;
+      // The mode this state was *uploaded* for. We lock this at upload time
+      // so an interactive `render_mode` change can't accidentally request
+      // operations against a buffer we already discarded.
+      mode: "scatter" | "density" | "density-only";
     };
     let state: State | null = null;
 
@@ -428,6 +495,23 @@ export default {
         ],
       });
 
+      // Density-mode bin grid: BIN_N × BIN_N u32 counts.
+      const binCountBuf = device.createBuffer({
+        size: BIN_TOTAL * 4,
+        usage:
+          GPUBufferUsage.STORAGE |
+          GPUBufferUsage.COPY_DST |
+          GPUBufferUsage.COPY_SRC,
+      });
+      const densityRenderBindGroup = device.createBindGroup({
+        layout: densityRenderPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: densityRenderUbo } },
+          { binding: 1, resource: { buffer: binCountBuf } },
+          { binding: 2, resource: { buffer: paletteBuf } },
+        ],
+      });
+
       return {
         n,
         posBuf,
@@ -455,6 +539,13 @@ export default {
         cellCountBuf,
         pointIdsBuf,
         hoverQueryBindGroup,
+        densityReady: false,
+        densityOrigin: [0, 0],
+        densityInvCell: [1, 1],
+        binCountBuf,
+        densityRenderBindGroup,
+        densityLogMax: 1,
+        mode: "scatter",
       };
     }
 
@@ -529,7 +620,7 @@ export default {
       const pass1 = enc1.beginComputePass();
       pass1.setPipeline(gridCountPipeline);
       pass1.setBindGroup(0, countBindGroup);
-      pass1.dispatchWorkgroups(Math.ceil(s.n / 64));
+      dispatchN(pass1, s.n);
       pass1.end();
       enc1.copyBufferToBuffer(s.cellCountBuf, 0, cellCountStaging, 0, CELL_TOTAL * 4);
       device.queue.submit([enc1.finish()]);
@@ -563,13 +654,96 @@ export default {
       const pass2 = enc2.beginComputePass();
       pass2.setPipeline(gridScatterPipeline);
       pass2.setBindGroup(0, scatterBindGroup);
-      pass2.dispatchWorkgroups(Math.ceil(s.n / 64));
+      dispatchN(pass2, s.n);
       pass2.end();
       device.queue.submit([enc2.finish()]);
 
       cellCursorBuf.destroy();
       gridUbo.destroy();
       s.gridReady = true;
+    }
+
+    // Build the BIN_N × BIN_N density grid for render_mode="density". Single
+    // compute pass over the points; CPU readback finds the max bin count to
+    // calibrate the log-color map.
+    async function buildDensityGrid(s: State): Promise<void> {
+      // World bbox (re-derive here so buildDensityGrid stays independent of
+      // buildHoverGrid's ordering).
+      let xMin = Infinity;
+      let xMax = -Infinity;
+      let yMin = Infinity;
+      let yMax = -Infinity;
+      const p = s.positionsCpu;
+      for (let i = 0; i < p.length; i += 2) {
+        const xi = p[i];
+        const yi = p[i + 1];
+        if (xi < xMin) xMin = xi;
+        if (xi > xMax) xMax = xi;
+        if (yi < yMin) yMin = yi;
+        if (yi > yMax) yMax = yi;
+      }
+      const padX = ((xMax - xMin) || 1) * 1e-4;
+      const padY = ((yMax - yMin) || 1) * 1e-4;
+      xMin -= padX;
+      xMax += padX;
+      yMin -= padY;
+      yMax += padY;
+      const cellW = (xMax - xMin) / BIN_N;
+      const cellH = (yMax - yMin) / BIN_N;
+      const invX = cellW > 0 ? 1 / cellW : 1;
+      const invY = cellH > 0 ? 1 / cellH : 1;
+      s.densityOrigin = [xMin, yMin];
+      s.densityInvCell = [invX, invY];
+
+      // Build-pass uniform buffer.
+      const buildUbo = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      const buildHeader = new ArrayBuffer(32);
+      new Uint32Array(buildHeader, 0, 4).set([s.n, BIN_N, 0, 0]);
+      new Float32Array(buildHeader, 16, 4).set([xMin, yMin, invX, invY]);
+      writeBuf(buildUbo, 0, new Uint8Array(buildHeader));
+
+      // Zero the bin count buffer.
+      const zeros = new Uint32Array(BIN_TOTAL);
+      writeBuf(s.binCountBuf, 0, zeros);
+
+      const buildBindGroup = device.createBindGroup({
+        layout: densityBuildPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: s.posBuf } },
+          { binding: 1, resource: { buffer: s.binCountBuf } },
+          { binding: 2, resource: { buffer: buildUbo } },
+        ],
+      });
+
+      const staging = device.createBuffer({
+        size: BIN_TOTAL * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(densityBuildPipeline);
+      pass.setBindGroup(0, buildBindGroup);
+      dispatchN(pass, s.n);
+      pass.end();
+      enc.copyBufferToBuffer(s.binCountBuf, 0, staging, 0, BIN_TOTAL * 4);
+      device.queue.submit([enc.finish()]);
+
+      await staging.mapAsync(GPUMapMode.READ);
+      const counts = new Uint32Array(staging.getMappedRange());
+      let maxC = 0;
+      for (let i = 0; i < counts.length; i++) {
+        if (counts[i] > maxC) maxC = counts[i];
+      }
+      staging.unmap();
+      staging.destroy();
+      buildUbo.destroy();
+
+      s.densityLogMax = Math.log(maxC + 1);
+      s.densityReady = true;
     }
 
     function fitView(positions: Float32Array, s: State) {
@@ -596,24 +770,27 @@ export default {
       s.viewSy = margin / sy;
     }
 
+    function activeRenderMode(): "scatter" | "density" | "density-only" {
+      if (!state) return "scatter";
+      // density-only is locked at upload time — positions buffer is gone,
+      // there's no way to render scatter anymore.
+      if (state.mode === "density-only") return "density-only";
+      const requested = (model.get<string>("render_mode") || "scatter") as
+        | "scatter"
+        | "density"
+        | "density-only";
+      if (requested === "density-only") {
+        // The trait was changed AFTER an upload in a different mode; can't
+        // retroactively drop positions. Just render density.
+        return state.densityReady ? "density" : "scatter";
+      }
+      if (requested === "density" && !state.densityReady) return "scatter";
+      return requested;
+    }
+
     function renderFrame() {
       if (!state) return;
-      const dim = Math.min(1.0, Math.max(0.0, model.get<number>("selection_dim") ?? 0.4));
-      const data = new Float32Array([
-        gpuCanvas.width,
-        gpuCanvas.height,
-        state.pointSize,
-        state.paletteN,
-        state.viewTx,
-        state.viewTy,
-        state.viewSx,
-        state.viewSy,
-        dim,
-        state.hasSelection ? 1.0 : 0.0,
-        0.0,
-        0.0, // pad to 48-byte uniform buffer (16-aligned)
-      ]);
-      writeBuf(ubo, 0, data);
+      const mode = activeRenderMode();
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginRenderPass({
         colorAttachments: [
@@ -625,9 +802,55 @@ export default {
           },
         ],
       });
-      pass.setPipeline(renderPipeline);
-      pass.setBindGroup(0, state.bindGroup);
-      pass.draw(6, state.n);
+
+      if (mode === "density" || mode === "density-only") {
+        const header = new ArrayBuffer(64);
+        new Float32Array(header, 0, 2).set([gpuCanvas.width, gpuCanvas.height]);
+        new Uint32Array(header, 8, 1)[0] = BIN_N;
+        new Float32Array(header, 12, 1)[0] = state.densityLogMax;
+        new Float32Array(header, 16, 4).set([
+          state.viewTx,
+          state.viewTy,
+          state.viewSx,
+          state.viewSy,
+        ]);
+        new Float32Array(header, 32, 4).set([
+          state.densityOrigin[0],
+          state.densityOrigin[1],
+          state.densityInvCell[0],
+          state.densityInvCell[1],
+        ]);
+        new Uint32Array(header, 48, 1)[0] = state.paletteN;
+        writeBuf(densityRenderUbo, 0, new Uint8Array(header));
+
+        pass.setPipeline(densityRenderPipeline);
+        pass.setBindGroup(0, state.densityRenderBindGroup);
+        pass.draw(3, 1);
+      } else {
+        const dim = Math.min(
+          1.0,
+          Math.max(0.0, model.get<number>("selection_dim") ?? 0.4),
+        );
+        const data = new Float32Array([
+          gpuCanvas.width,
+          gpuCanvas.height,
+          state.pointSize,
+          state.paletteN,
+          state.viewTx,
+          state.viewTy,
+          state.viewSx,
+          state.viewSy,
+          dim,
+          state.hasSelection ? 1.0 : 0.0,
+          0.0,
+          0.0, // pad to 48-byte uniform buffer (16-aligned)
+        ]);
+        writeBuf(ubo, 0, data);
+        pass.setPipeline(renderPipeline);
+        pass.setBindGroup(0, state.bindGroup);
+        pass.draw(6, state.n);
+      }
+
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
@@ -723,14 +946,14 @@ export default {
       const clearPass = encoder.beginComputePass();
       clearPass.setPipeline(maskClearPipeline);
       clearPass.setBindGroup(0, state.maskClearBindGroup);
-      clearPass.dispatchWorkgroups(Math.ceil(state.n / 64));
+      dispatchN(clearPass, state.n);
       clearPass.end();
 
       // Then: lasso hit-test. Writes to out_indices + selection_mask.
       const pass = encoder.beginComputePass();
       pass.setPipeline(computePipeline);
       pass.setBindGroup(0, state.computeBindGroup);
-      pass.dispatchWorkgroups(Math.ceil(state.n / 64));
+      dispatchN(pass, state.n);
       pass.end();
 
       encoder.copyBufferToBuffer(counterBuf, 0, counterStaging, 0, 4);
@@ -771,6 +994,13 @@ export default {
       pendingAck = { count, ms };
     }
 
+    model.on("change:render_mode", () => {
+      if (!state) return;
+      // Hide tooltip on mode switch — semantics differ between modes.
+      tooltip.style.display = "none";
+      renderFrame();
+    });
+
     let pendingAck: { count: number; ms: number } | null = null;
     model.on("change:selection_count", () => {
       if (!pendingAck || !state) return;
@@ -791,6 +1021,9 @@ export default {
       if (!state) return;
       gpuCanvas.setPointerCapture(e.pointerId);
       if (e.shiftKey) {
+        // Density-only mode has no positions buffer — lasso is meaningless.
+        // Silently swallow the shift-drag so it doesn't half-draw an overlay.
+        if (state.mode === "density-only") return;
         // Begin new lasso — clear any previously-committed outline first.
         clearLassoOverlay();
         lassoMode = "drawing";
@@ -868,6 +1101,11 @@ export default {
     function queryHover(clientX: number, clientY: number) {
       if (!state || !state.gridReady) return;
       if (lassoMode !== "idle" || panning) return;
+      const m = activeRenderMode();
+      if (m === "density" || m === "density-only") {
+        hideTooltip();
+        return;
+      }
       const rect = gpuCanvas.getBoundingClientRect();
       const lx = clientX - rect.left;
       const ly = clientY - rect.top;
@@ -996,11 +1234,368 @@ export default {
       });
     }
 
+    // -------- Chunked stream state (P5.1b) --------
+    // Holds metadata + GPU resources during a multi-message chunked upload.
+    // Single-shot 'data' messages bypass this entirely.
+    type StreamState = {
+      gen: number;
+      mode: "scatter" | "density" | "density-only";
+      n: number;
+      nChunks: number;
+      chunkN: number;
+      bbox: [number, number, number, number]; // [xmin, xmax, ymin, ymax]
+      received: number;
+      paletteRGBA: Float32Array;
+      tStart: number;
+      bytesReceived: number;
+      // For scatter / density modes: accumulate the full positions + colors
+      // on the JS side, then construct State via uploadState at finalize.
+      positions?: Float32Array;
+      colorCodes?: Uint32Array;
+      // For density-only: per-chunk GPU upload + density build, then drop.
+      transientPosBuf?: GPUBuffer;
+      densityBuildUbo?: GPUBuffer;
+      binCountBuf?: GPUBuffer;
+      // Density-only render plumbing (allocated lazily at first chunk).
+      densityRenderBindGroup?: GPUBindGroup;
+      paletteBuf?: GPUBuffer;
+    };
+    let stream: StreamState | null = null;
+
+    async function handleDataStart(
+      msg: {
+        gen: number;
+        n: number;
+        n_chunks: number;
+        chunk_n: number;
+        bbox: number[];
+        render_mode: "scatter" | "density" | "density-only";
+      },
+      paletteBuffer: ArrayBuffer | ArrayBufferView,
+    ): Promise<void> {
+      // Abort any prior in-flight stream.
+      if (stream) {
+        stream.transientPosBuf?.destroy();
+        stream.densityBuildUbo?.destroy();
+        stream.binCountBuf?.destroy();
+        stream.paletteBuf?.destroy();
+        stream = null;
+      }
+      const palBytes = bufferToBytes(paletteBuffer);
+      const paletteRGBA = new Float32Array(
+        new Float32Array(
+          palBytes.buffer,
+          palBytes.byteOffset,
+          palBytes.byteLength / 4,
+        ),
+      );
+
+      stream = {
+        gen: msg.gen,
+        mode: msg.render_mode,
+        n: msg.n,
+        nChunks: msg.n_chunks,
+        chunkN: msg.chunk_n,
+        bbox: [msg.bbox[0], msg.bbox[1], msg.bbox[2], msg.bbox[3]],
+        received: 0,
+        paletteRGBA,
+        tStart: performance.now(),
+        bytesReceived: 0,
+      };
+
+      if (msg.render_mode === "density-only") {
+        // Allocate only the buffers we'll actually keep past finalize:
+        // bin_count grid + palette + render UBO/bind group. Plus a transient
+        // per-chunk positions buffer used to feed the density build kernel.
+        stream.transientPosBuf = device.createBuffer({
+          size: Math.max(8, msg.chunk_n * 8),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        stream.densityBuildUbo = device.createBuffer({
+          size: 32,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        stream.binCountBuf = device.createBuffer({
+          size: BIN_TOTAL * 4,
+          usage:
+            GPUBufferUsage.STORAGE |
+            GPUBufferUsage.COPY_DST |
+            GPUBufferUsage.COPY_SRC,
+        });
+        // Zero the bin grid.
+        writeBuf(stream.binCountBuf, 0, new Uint32Array(BIN_TOTAL));
+        stream.paletteBuf = device.createBuffer({
+          size: paletteRGBA.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        writeBuf(stream.paletteBuf, 0, paletteRGBA);
+        stream.densityRenderBindGroup = device.createBindGroup({
+          layout: densityRenderPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: densityRenderUbo } },
+            { binding: 1, resource: { buffer: stream.binCountBuf } },
+            { binding: 2, resource: { buffer: stream.paletteBuf } },
+          ],
+        });
+
+        // Compute origin + inv_cell once from the Python-supplied bbox so
+        // every chunk's build pass uses identical bin boundaries.
+        const [xMin, xMax, yMin, yMax] = stream.bbox;
+        const padX = ((xMax - xMin) || 1) * 1e-4;
+        const padY = ((yMax - yMin) || 1) * 1e-4;
+        const origin: [number, number] = [xMin - padX, yMin - padY];
+        const cellW = (xMax - xMin + 2 * padX) / BIN_N;
+        const cellH = (yMax - yMin + 2 * padY) / BIN_N;
+        const invCell: [number, number] = [
+          cellW > 0 ? 1 / cellW : 1,
+          cellH > 0 ? 1 / cellH : 1,
+        ];
+        // Density-only writes a minimal state object so the existing render
+        // path works. The unused fields point at the transient buffer too.
+        const stub = stream.transientPosBuf!;
+        state = {
+          n: msg.n,
+          posBuf: stub,
+          colorBuf: stub,
+          paletteBuf: stream.paletteBuf!,
+          paletteN: paletteRGBA.length / 4,
+          bindGroup: device.createBindGroup({
+            layout: renderPipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: ubo } },
+              { binding: 1, resource: { buffer: stub } },
+              { binding: 2, resource: { buffer: stub } },
+              { binding: 3, resource: { buffer: stream.paletteBuf! } },
+              { binding: 4, resource: { buffer: stub } },
+            ],
+          }),
+          computeBindGroup: null as unknown as GPUBindGroup,
+          maskClearBindGroup: null as unknown as GPUBindGroup,
+          maskClearUbo: stub,
+          selectionMask: stub,
+          outIndices: stub,
+          outStaging: stub,
+          pointSize: 1.2,
+          viewTx: 0,
+          viewTy: 0,
+          viewSx: 1,
+          viewSy: 1,
+          hasSelection: false,
+          positionsCpu: new Float32Array(0),
+          gridReady: false,
+          gridOrigin: [0, 0],
+          gridInvCell: [1, 1],
+          cellStartBuf: stub,
+          cellCountBuf: stub,
+          pointIdsBuf: stub,
+          hoverQueryBindGroup: null as unknown as GPUBindGroup,
+          densityReady: false, // flipped at finalize
+          densityOrigin: origin,
+          densityInvCell: invCell,
+          binCountBuf: stream.binCountBuf!,
+          densityRenderBindGroup: stream.densityRenderBindGroup!,
+          densityLogMax: 1,
+          mode: "density-only",
+        };
+        // Use bbox to set the view directly (no positions-iteration).
+        const cx = (xMin + xMax) / 2;
+        const cy = (yMin + yMax) / 2;
+        const sx = (xMax - xMin) || 1;
+        const sy = (yMax - yMin) || 1;
+        const margin = 1.8;
+        state.viewTx = cx;
+        state.viewTy = cy;
+        state.viewSx = margin / sx;
+        state.viewSy = margin / sy;
+
+        // Pre-fill the build UBO header (it doesn't change per chunk except
+        // n_points, which we patch in place).
+        const hdr = new ArrayBuffer(32);
+        new Uint32Array(hdr, 0, 4).set([0, BIN_N, 0, 0]); // n_points filled per chunk
+        new Float32Array(hdr, 16, 4).set([origin[0], origin[1], invCell[0], invCell[1]]);
+        writeBuf(stream.densityBuildUbo!, 0, new Uint8Array(hdr));
+      } else {
+        // scatter / density: accumulate the full data CPU-side, then build
+        // state once at finalize using uploadState (same as single-shot).
+        stream.positions = new Float32Array(msg.n * 2);
+        stream.colorCodes = new Uint32Array(msg.n);
+      }
+
+      log(
+        `⏳ Stipple — loading 0 / ${msg.n_chunks} chunks · ${msg.n.toLocaleString()} rows · mode=${msg.render_mode}\n` +
+          `adapter: ${adapterInfo}`,
+      );
+    }
+
+    async function handleDataChunk(
+      msg: { gen: number; i: number },
+      ipcBuffer: ArrayBuffer | ArrayBufferView,
+    ): Promise<void> {
+      if (!stream || msg.gen !== stream.gen) return;
+      const ipcBytes = bufferToBytes(ipcBuffer);
+      stream.bytesReceived += ipcBytes.byteLength;
+      const table = tableFromIPC(ipcBytes);
+      const x = table.getChild("x")!.toArray() as Float32Array;
+      const y = table.getChild("y")!.toArray() as Float32Array;
+      const colorCol = table.getChild("color");
+      const chunkN = x.length;
+      const chunkPositions = new Float32Array(chunkN * 2);
+      for (let i = 0; i < chunkN; i++) {
+        chunkPositions[i * 2] = x[i];
+        chunkPositions[i * 2 + 1] = y[i];
+      }
+      let chunkCodes: Uint32Array;
+      if (colorCol) {
+        const raw = colorCol.toArray();
+        chunkCodes =
+          raw instanceof Uint32Array ? raw : new Uint32Array(raw as ArrayLike<number>);
+      } else {
+        chunkCodes = new Uint32Array(chunkN);
+      }
+
+      const offsetPoints = msg.i * stream.chunkN;
+
+      if (stream.mode === "density-only") {
+        // Upload this chunk's positions to the transient buffer, then run
+        // the density build over [0..chunkN). atomicAdds accumulate into
+        // the persistent bin_count buffer.
+        writeBuf(stream.transientPosBuf!, 0, chunkPositions);
+        // Patch n_points in the build UBO.
+        writeBuf(stream.densityBuildUbo!, 0, new Uint32Array([chunkN]));
+        const buildBindGroup = device.createBindGroup({
+          layout: densityBuildPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: stream.transientPosBuf! } },
+            { binding: 1, resource: { buffer: stream.binCountBuf! } },
+            { binding: 2, resource: { buffer: stream.densityBuildUbo! } },
+          ],
+        });
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(densityBuildPipeline);
+        pass.setBindGroup(0, buildBindGroup);
+        dispatchN(pass, chunkN);
+        pass.end();
+        device.queue.submit([enc.finish()]);
+      } else {
+        // Stash into the JS-side full-size arrays; uploadState consumes
+        // these at finalize.
+        stream.positions!.set(chunkPositions, offsetPoints * 2);
+        stream.colorCodes!.set(chunkCodes, offsetPoints);
+      }
+
+      stream.received += 1;
+      log(
+        `⏳ Stipple — loading ${stream.received} / ${stream.nChunks} chunks · ${stream.n.toLocaleString()} rows · mode=${stream.mode}`,
+      );
+    }
+
+    async function handleDataFinalize(msg: { gen: number }): Promise<void> {
+      if (!stream || msg.gen !== stream.gen) return;
+      const s = stream;
+      stream = null;
+
+      if (s.mode === "density-only") {
+        // Compute log_max via one readback of the accumulated bin grid.
+        const staging = device.createBuffer({
+          size: BIN_TOTAL * 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(s.binCountBuf!, 0, staging, 0, BIN_TOTAL * 4);
+        device.queue.submit([enc.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const counts = new Uint32Array(staging.getMappedRange());
+        let maxC = 0;
+        for (let i = 0; i < counts.length; i++) {
+          if (counts[i] > maxC) maxC = counts[i];
+        }
+        staging.unmap();
+        staging.destroy();
+        s.densityBuildUbo?.destroy();
+        // Transient positions buffer is no longer needed.
+        s.transientPosBuf?.destroy();
+
+        state!.densityLogMax = Math.log(maxC + 1);
+        state!.densityReady = true;
+        renderFrame();
+      } else {
+        // scatter / density: assemble State from the accumulated arrays.
+        const positions = s.positions!;
+        const colorCodes = s.colorCodes!;
+        state = uploadState(positions, colorCodes, s.paletteRGBA);
+        state.mode = s.mode;
+        fitView(positions, state);
+        renderFrame();
+        // Background-build hover grid (scatter only) and density grid.
+        if (s.mode === "scatter") {
+          void buildHoverGrid(state).catch((err) => {
+            console.warn("[stipple] hover grid build failed:", err);
+          });
+        }
+        void buildDensityGrid(state)
+          .then(() => {
+            if (state && state.mode === "density") renderFrame();
+          })
+          .catch((err) => {
+            console.warn("[stipple] density grid build failed:", err);
+          });
+      }
+
+      const totalMs = (performance.now() - s.tStart).toFixed(0);
+      const mb = (s.bytesReceived / (1024 * 1024)).toFixed(2);
+      model.set("rows_received", s.n);
+      model.set("bytes_received", s.bytesReceived);
+      model.set("status", "data-rendered");
+      model.save_changes();
+
+      const { avgMs, fps } = await benchmarkFPS(30);
+      model.set("avg_frame_ms", avgMs);
+      model.set("last_fps", fps);
+      model.save_changes();
+
+      log(
+        `✓ Stipple — ${s.n.toLocaleString()} rows · mode=${s.mode}\n` +
+          `Arrow IPC: ${mb} MB across ${s.nChunks} chunks · ${totalMs} ms wall\n` +
+          `FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` +
+          (s.mode === "density-only"
+            ? "lasso + hover disabled (density-only)\n"
+            : "shift+drag to lasso · drag to pan · wheel to zoom\n") +
+          `adapter: ${adapterInfo}`,
+      );
+    }
+
     model.on("msg:custom", ((..._args: unknown[]) => {
       const args = _args as [unknown, unknown[]];
-      const msg = args[0] as { type?: string } | undefined;
+      const msg = args[0] as { type?: string; [k: string]: unknown } | undefined;
       const buffers = args[1] as Array<ArrayBuffer | ArrayBufferView> | undefined;
-      if (!msg || msg.type !== "data") return;
+      if (!msg) return;
+      if (msg.type === "data_start") {
+        if (!buffers || buffers.length === 0) {
+          fail("decode-error", "data_start without palette buffer", "no buffer");
+          return;
+        }
+        void handleDataStart(
+          msg as unknown as Parameters<typeof handleDataStart>[0],
+          buffers[0],
+        ).catch((e) => fail("decode-error", String(e), "data_start threw"));
+        return;
+      }
+      if (msg.type === "data_chunk") {
+        if (!buffers || buffers.length === 0) return;
+        void handleDataChunk(
+          msg as unknown as Parameters<typeof handleDataChunk>[0],
+          buffers[0],
+        ).catch((e) => fail("decode-error", String(e), "data_chunk threw"));
+        return;
+      }
+      if (msg.type === "data_finalize") {
+        void handleDataFinalize(
+          msg as unknown as Parameters<typeof handleDataFinalize>[0],
+        ).catch((e) => fail("decode-error", String(e), "data_finalize threw"));
+        return;
+      }
+      if (msg.type !== "data") return;
       if (!buffers || buffers.length === 0) {
         fail("decode-error", "data msg without buffer", "no buffer");
         return;
@@ -1065,6 +1660,16 @@ export default {
             // eslint-disable-next-line no-console
             console.warn("[stipple] hover grid build failed:", err);
           });
+          // Build the density grid asynchronously. If the user requested
+          // density mode, kick a re-render when it's ready.
+          void buildDensityGrid(state)
+            .then(() => {
+              if (model.get<string>("render_mode") === "density") renderFrame();
+            })
+            .catch((err) => {
+              // eslint-disable-next-line no-console
+              console.warn("[stipple] density grid build failed:", err);
+            });
 
           model.set("rows_received", n);
           model.set("bytes_received", bytes.byteLength);
