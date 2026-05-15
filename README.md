@@ -1,9 +1,9 @@
 # Stipple
 
-A WebGPU scatter widget for Jupyter that renders **10 million points at 60 FPS
-in a browser tab**, lets you lasso a region, and hands the row indices back to
-your Python kernel in milliseconds — without re-uploading positions, without
-tiling, and without an intermediate server.
+A WebGPU scatter widget for Jupyter that renders **up to 600 million points in
+a browser tab** — interactive at 10 M with 60 FPS pan/zoom and shift-drag
+lasso → numpy round-trip in milliseconds, density-rendered all the way to
+TPC-H `lineitem` at SF=100. No tiling, no server, no levels-of-detail.
 
 ```python
 from stipple import Stipple
@@ -37,7 +37,7 @@ you keep running into:
 | datashader              | billions       | rasters → no per-point    | full re-aggregation       |
 | deepscatter             | ~5–10 M        | partial (WebGL)           | encoding object reset     |
 | Nomic Atlas             | 100 M+         | cloud round-trip          | server call               |
-| **Stipple**             | **10 M – 600 M** | **`w.selected_indices` in ms** | **`w.update_color(arr)` — one GPU buffer swap** |
+| **Stipple**             | **10 M scatter / 600 M density** | **`w.selected_indices` in ms (≤10 M)** | **`w.update_color(arr)` — one GPU buffer swap** |
 
 The line that nothing else does cleanly is the bottom one: **lasso a region,
 run a Python cell that uses the indices, hand the result back, watch every
