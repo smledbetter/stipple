@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Vite output is built artifact, but tracked because anywidget loads from it
+# Uncomment to exclude from git if we switch to a release-only build:
+# src/stipple/_static/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+.jupyter-probe/
+
+# Probe diagnostic screenshots — regenerable via scripts/probe_*.py
+scripts/*.png
+scripts/g*-result.png
+scripts/ex-*.png
+scripts/sticky-*.png
