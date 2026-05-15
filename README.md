@@ -25,10 +25,11 @@ VS Code, and Colab with `pip install stipple`.
 
 ![Paint by lasso on 10M FineWeb embeddings](docs/paint-by-lasso-demo.gif)
 
-*Real-time recording ([full-quality MP4](docs/paint-by-lasso-demo.mp4)): 10 M
-FineWeb-Edu documents load, the user shift-drags a lasso, a Python cell uses
+***This is real time*** — no time compression, no skipped frames
+([full-quality MP4](docs/paint-by-lasso-demo.mp4)). 10 M FineWeb-Edu
+documents load, the user shift-drags a lasso, a Python cell uses
 `w.selected_indices` to compute a Gaussian falloff from the lassoed centroid,
-and `w.update_color()` re-shades all 10 M points in one GPU buffer swap.*
+and `w.update_color()` re-shades all 10 M points in one GPU buffer swap.
 
 ---
 
