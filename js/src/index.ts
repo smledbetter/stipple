@@ -1308,7 +1308,19 @@ export default {
     let stream: StreamState | null = null;
     // Accumulator for chunked update_color() messages — recolor sends
     // raw uint32 codes (no Arrow round-trip) because every byte is data.
-    let colorUpdateStream: { gen: number; n: number; codes: Uint32Array } | null = null;
+    // `chunksRemaining` lets finalize detect dropped chunks and abort
+    // rather than commit a partial recolor that paints a slice of points
+    // in stale colors.
+    let colorUpdateStream: {
+      gen: number;
+      n: number;
+      codes: Uint32Array;
+      chunksRemaining: number;
+    } | null = null;
+    // Generation counter so back-to-back update_color() calls don't race;
+    // each Python send carries a monotonically-increasing `gen`. We drop
+    // any message whose `gen` is older than the latest accepted one.
+    let latestColorGen = 0;
 
     async function handleDataStart(
       msg: {
@@ -1719,7 +1731,15 @@ export default {
         return;
       }
       if (msg.type === "color_update") {
-        if (!state || !buffers || buffers.length === 0) return;
+        const m = msg as unknown as { gen: number; n: number };
+        if (!state) {
+          // eslint-disable-next-line no-console
+          console.warn("[stipple] color_update arrived before data load");
+          return;
+        }
+        if (m.gen < latestColorGen) return;  // stale relative to in-flight chunked update
+        latestColorGen = m.gen;
+        if (!buffers || buffers.length === 0) return;
         const bytes = bufferToBytes(buffers[0]);
         const codes = new Uint32Array(
           bytes.buffer,
@@ -1731,11 +1751,13 @@ export default {
         return;
       }
       if (msg.type === "color_update_start") {
-        const m = msg as unknown as { gen: number; n: number };
+        const m = msg as unknown as { gen: number; n: number; n_chunks: number };
+        if (m.gen < latestColorGen) return;
         colorUpdateStream = {
           gen: m.gen,
           n: m.n,
           codes: new Uint32Array(m.n),
+          chunksRemaining: m.n_chunks,
         };
         return;
       }
@@ -1756,21 +1778,24 @@ export default {
           bytes.byteLength / 4,
         );
         colorUpdateStream.codes.set(chunk, m.a);
+        colorUpdateStream.chunksRemaining -= 1;
         return;
       }
       if (msg.type === "color_update_finalize") {
         const m = msg as unknown as { gen: number };
-        if (
-          !state ||
-          !colorUpdateStream ||
-          colorUpdateStream.gen !== m.gen
-        ) {
-          colorUpdateStream = null;
+        const s = colorUpdateStream;
+        colorUpdateStream = null;
+        if (!state || !s || s.gen !== m.gen) return;
+        if (s.chunksRemaining !== 0) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[stipple] dropping recolor — ${s.chunksRemaining} chunks never arrived`,
+          );
           return;
         }
-        writeBuf(state.colorBuf, 0, colorUpdateStream.codes);
+        latestColorGen = s.gen;
+        writeBuf(state.colorBuf, 0, s.codes);
         requestRender();
-        colorUpdateStream = null;
         return;
       }
       if (msg.type !== "data") return;

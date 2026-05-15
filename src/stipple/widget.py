@@ -166,6 +166,7 @@ class Stipple(anywidget.AnyWidget):
             columns["color"] = codes
             self.color_categories = []
             self.color_range = []
+            kind = "continuous"
         else:
             color_arr = np.asarray(color)
             if color_arr.ndim != 1 or color_arr.shape[0] != n:
@@ -181,18 +182,10 @@ class Stipple(anywidget.AnyWidget):
             if isinstance(pal_arg, str) and pal_arg == "auto":
                 pal_arg = "viridis" if kind == "continuous" else "tab10"
             palette_rgba = _palettes.resolve_palette(pal_arg, want_continuous=(kind == "continuous"))
+            palette_n = int(palette_rgba.shape[0])
 
             if kind == "continuous":
-                v = color_arr.astype(np.float32)
-                finite = v[np.isfinite(v)]
-                lo = float(vmin) if vmin is not None else (float(finite.min()) if finite.size else 0.0)
-                hi = float(vmax) if vmax is not None else (float(finite.max()) if finite.size else 1.0)
-                span = max(hi - lo, 1e-12)
-                normalized = np.clip((v - lo) / span, 0.0, 1.0)
-                palette_n = int(palette_rgba.shape[0])
-                codes = np.clip(
-                    np.rint(normalized * (palette_n - 1)), 0, palette_n - 1
-                ).astype(np.uint32)
+                codes, lo, hi = _quantize_continuous(color_arr, palette_n, vmin, vmax)
                 self.color_categories = []
                 self.color_range = [lo, hi]
             else:  # categorical
@@ -218,13 +211,10 @@ class Stipple(anywidget.AnyWidget):
             "n": n,
         }
         # Cache palette size + kind so update_color() can re-quantize
-        # without going through resolve_palette again. The palette
-        # itself stays fixed on the GPU side; only the per-point codes
-        # change on recolor.
+        # against the fixed GPU palette without going through
+        # resolve_palette again.
         self._palette_n = int(palette_rgba.shape[0])
-        self._color_kind = "continuous" if (
-            self.render_mode in ("density", "density-only") or self.color_range
-        ) else "categorical"
+        self._color_kind = kind
         self.n_points = n
 
         if self.client_ready:
@@ -329,39 +319,34 @@ class Stipple(anywidget.AnyWidget):
                 f"got shape {color_arr.shape}."
             )
 
-        palette_n = max(1, getattr(self, "_palette_n", 256))
-        kind = getattr(self, "_color_kind", "continuous")
-        if kind == "continuous":
-            v = color_arr.astype(np.float32)
-            finite = v[np.isfinite(v)]
-            lo = float(vmin) if vmin is not None else (
-                float(finite.min()) if finite.size else 0.0
-            )
-            hi = float(vmax) if vmax is not None else (
-                float(finite.max()) if finite.size else 1.0
-            )
-            span = max(hi - lo, 1e-12)
-            normalized = np.clip((v - lo) / span, 0.0, 1.0)
-            codes = np.clip(
-                np.rint(normalized * (palette_n - 1)), 0, palette_n - 1
-            ).astype(np.uint32)
+        palette_n = max(1, self._palette_n)
+        if self._color_kind == "continuous":
+            codes, lo, hi = _quantize_continuous(color_arr, palette_n, vmin, vmax)
             self.color_range = [lo, hi]
         else:
             codes, cats = _factorize_to_codes(color_arr)
+            if len(cats) > palette_n:
+                # Codes would wrap modulo palette_n, silently mis-coloring
+                # most points. Refuse rather than mis-render.
+                raise ValueError(
+                    f"categorical recolor produced {len(cats)} categories but the "
+                    f"palette fixed at init has {palette_n} slots. Rebuild Stipple "
+                    f"with the new categorical color, or pass a continuous score."
+                )
             self.color_categories = [_to_jsonable(c) for c in cats]
 
         codes = np.ascontiguousarray(codes, dtype=np.uint32)
         n = int(self.n_points)
+        self._gen_counter += 1
+        gen = self._gen_counter
 
         if n <= self._CHUNK_THRESHOLD:
             self.send(
-                {"type": "color_update", "n": n},
+                {"type": "color_update", "gen": gen, "n": n},
                 buffers=[codes.tobytes()],
             )
             return
 
-        self._gen_counter += 1
-        gen = self._gen_counter
         chunk_n = self._CHUNK_THRESHOLD
         n_chunks = (n + chunk_n - 1) // chunk_n
         self.send(
@@ -377,7 +362,7 @@ class Stipple(anywidget.AnyWidget):
             a = i * chunk_n
             b = min(a + chunk_n, n)
             self.send(
-                {"type": "color_update_chunk", "gen": gen, "i": i, "a": a, "b": b},
+                {"type": "color_update_chunk", "gen": gen, "i": i, "a": a},
                 buffers=[codes[a:b].tobytes()],
             )
         self.send({"type": "color_update_finalize", "gen": gen})
@@ -488,6 +473,29 @@ def _infer_color_kind(arr: np.ndarray) -> str:
     if arr.dtype.kind in ("f",):
         return "continuous"
     return "categorical"
+
+
+def _quantize_continuous(
+    arr: np.ndarray,
+    palette_n: int,
+    vmin: float | None,
+    vmax: float | None,
+) -> tuple[np.ndarray, float, float]:
+    """Min/max-normalize ``arr`` and quantize to uint32 palette indices.
+
+    Returns ``(codes, lo, hi)`` so the caller can sync the color range
+    trait. NaN/inf values are clamped to 0 (palette's first slot).
+    """
+    v = arr.astype(np.float32)
+    finite = v[np.isfinite(v)]
+    lo = float(vmin) if vmin is not None else (float(finite.min()) if finite.size else 0.0)
+    hi = float(vmax) if vmax is not None else (float(finite.max()) if finite.size else 1.0)
+    span = max(hi - lo, 1e-12)
+    normalized = np.clip((v - lo) / span, 0.0, 1.0)
+    codes = np.clip(
+        np.rint(normalized * (palette_n - 1)), 0, palette_n - 1
+    ).astype(np.uint32)
+    return codes, lo, hi
 
 
 def _factorize_to_codes(arr: np.ndarray) -> tuple[np.ndarray, list[Any]]:

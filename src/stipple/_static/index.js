@@ -12173,6 +12173,7 @@ adapter: ${adapterInfo}`);
     }
     let stream = null;
     let colorUpdateStream = null;
+    let latestColorGen = 0;
     async function handleDataStart(msg, paletteBuffer) {
       if (stream) {
         stream.transientPosBuf?.destroy();
@@ -12498,7 +12499,14 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
         return;
       }
       if (msg.type === "color_update") {
-        if (!state || !buffers || buffers.length === 0) return;
+        const m = msg;
+        if (!state) {
+          console.warn("[stipple] color_update arrived before data load");
+          return;
+        }
+        if (m.gen < latestColorGen) return;
+        latestColorGen = m.gen;
+        if (!buffers || buffers.length === 0) return;
         const bytes = bufferToBytes(buffers[0]);
         const codes = new Uint32Array(
           bytes.buffer,
@@ -12511,10 +12519,12 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
       }
       if (msg.type === "color_update_start") {
         const m = msg;
+        if (m.gen < latestColorGen) return;
         colorUpdateStream = {
           gen: m.gen,
           n: m.n,
-          codes: new Uint32Array(m.n)
+          codes: new Uint32Array(m.n),
+          chunksRemaining: m.n_chunks
         };
         return;
       }
@@ -12530,17 +12540,23 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
           bytes.byteLength / 4
         );
         colorUpdateStream.codes.set(chunk, m.a);
+        colorUpdateStream.chunksRemaining -= 1;
         return;
       }
       if (msg.type === "color_update_finalize") {
         const m = msg;
-        if (!state || !colorUpdateStream || colorUpdateStream.gen !== m.gen) {
-          colorUpdateStream = null;
+        const s = colorUpdateStream;
+        colorUpdateStream = null;
+        if (!state || !s || s.gen !== m.gen) return;
+        if (s.chunksRemaining !== 0) {
+          console.warn(
+            `[stipple] dropping recolor — ${s.chunksRemaining} chunks never arrived`
+          );
           return;
         }
-        writeBuf(state.colorBuf, 0, colorUpdateStream.codes);
+        latestColorGen = s.gen;
+        writeBuf(state.colorBuf, 0, s.codes);
         requestRender();
-        colorUpdateStream = null;
         return;
       }
       if (msg.type !== "data") return;
