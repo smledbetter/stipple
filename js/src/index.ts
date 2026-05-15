@@ -1306,6 +1306,9 @@ export default {
       maxReduceBindGroup?: GPUBindGroup;
     };
     let stream: StreamState | null = null;
+    // Accumulator for chunked update_color() messages — recolor sends
+    // raw uint32 codes (no Arrow round-trip) because every byte is data.
+    let colorUpdateStream: { gen: number; n: number; codes: Uint32Array } | null = null;
 
     async function handleDataStart(
       msg: {
@@ -1713,6 +1716,61 @@ export default {
         void handleDataFinalize(
           msg as unknown as Parameters<typeof handleDataFinalize>[0],
         ).catch((e) => fail("decode-error", String(e), "data_finalize threw"));
+        return;
+      }
+      if (msg.type === "color_update") {
+        if (!state || !buffers || buffers.length === 0) return;
+        const bytes = bufferToBytes(buffers[0]);
+        const codes = new Uint32Array(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength / 4,
+        );
+        writeBuf(state.colorBuf, 0, codes);
+        requestRender();
+        return;
+      }
+      if (msg.type === "color_update_start") {
+        const m = msg as unknown as { gen: number; n: number };
+        colorUpdateStream = {
+          gen: m.gen,
+          n: m.n,
+          codes: new Uint32Array(m.n),
+        };
+        return;
+      }
+      if (msg.type === "color_update_chunk") {
+        const m = msg as unknown as { gen: number; a: number };
+        if (
+          !colorUpdateStream ||
+          colorUpdateStream.gen !== m.gen ||
+          !buffers ||
+          buffers.length === 0
+        ) {
+          return;
+        }
+        const bytes = bufferToBytes(buffers[0]);
+        const chunk = new Uint32Array(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength / 4,
+        );
+        colorUpdateStream.codes.set(chunk, m.a);
+        return;
+      }
+      if (msg.type === "color_update_finalize") {
+        const m = msg as unknown as { gen: number };
+        if (
+          !state ||
+          !colorUpdateStream ||
+          colorUpdateStream.gen !== m.gen
+        ) {
+          colorUpdateStream = null;
+          return;
+        }
+        writeBuf(state.colorBuf, 0, colorUpdateStream.codes);
+        requestRender();
+        colorUpdateStream = null;
         return;
       }
       if (msg.type !== "data") return;

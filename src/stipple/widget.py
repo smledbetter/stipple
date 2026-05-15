@@ -217,6 +217,14 @@ class Stipple(anywidget.AnyWidget):
             "bbox": (xmin, xmax, ymin, ymax),
             "n": n,
         }
+        # Cache palette size + kind so update_color() can re-quantize
+        # without going through resolve_palette again. The palette
+        # itself stays fixed on the GPU side; only the per-point codes
+        # change on recolor.
+        self._palette_n = int(palette_rgba.shape[0])
+        self._color_kind = "continuous" if (
+            self.render_mode in ("density", "density-only") or self.color_range
+        ) else "categorical"
         self.n_points = n
 
         if self.client_ready:
@@ -287,6 +295,92 @@ class Stipple(anywidget.AnyWidget):
                 buffers=[chunk_ipc],
             )
         self.send({"type": "data_finalize", "gen": gen})
+
+    def update_color(
+        self,
+        color: Any,
+        *,
+        vmin: float | None = None,
+        vmax: float | None = None,
+    ) -> None:
+        """Recolor all points without re-uploading positions.
+
+        ``color`` must be a 1-D array of length ``n_points``. Continuous
+        values are min/max-normalized into the palette set at init
+        (override with vmin/vmax). The new codes ship to the GPU as a
+        single ``color_update`` message (or chunked equivalent for
+        large N) and the canvas re-renders in milliseconds.
+
+        Usage — the "paint by lasso" loop::
+
+            seed = embeddings[w.selected_indices].mean(0)
+            sims = embeddings @ seed
+            w.update_color(sims)   # 10M points re-shade by similarity
+        """
+        if self.n_points == 0:
+            raise RuntimeError(
+                "update_color called before initial data load; "
+                "construct Stipple with x= and y= first."
+            )
+        color_arr = np.asarray(color)
+        if color_arr.ndim != 1 or color_arr.shape[0] != self.n_points:
+            raise ValueError(
+                f"color must be 1-D with length n_points={self.n_points}; "
+                f"got shape {color_arr.shape}."
+            )
+
+        palette_n = max(1, getattr(self, "_palette_n", 256))
+        kind = getattr(self, "_color_kind", "continuous")
+        if kind == "continuous":
+            v = color_arr.astype(np.float32)
+            finite = v[np.isfinite(v)]
+            lo = float(vmin) if vmin is not None else (
+                float(finite.min()) if finite.size else 0.0
+            )
+            hi = float(vmax) if vmax is not None else (
+                float(finite.max()) if finite.size else 1.0
+            )
+            span = max(hi - lo, 1e-12)
+            normalized = np.clip((v - lo) / span, 0.0, 1.0)
+            codes = np.clip(
+                np.rint(normalized * (palette_n - 1)), 0, palette_n - 1
+            ).astype(np.uint32)
+            self.color_range = [lo, hi]
+        else:
+            codes, cats = _factorize_to_codes(color_arr)
+            self.color_categories = [_to_jsonable(c) for c in cats]
+
+        codes = np.ascontiguousarray(codes, dtype=np.uint32)
+        n = int(self.n_points)
+
+        if n <= self._CHUNK_THRESHOLD:
+            self.send(
+                {"type": "color_update", "n": n},
+                buffers=[codes.tobytes()],
+            )
+            return
+
+        self._gen_counter += 1
+        gen = self._gen_counter
+        chunk_n = self._CHUNK_THRESHOLD
+        n_chunks = (n + chunk_n - 1) // chunk_n
+        self.send(
+            {
+                "type": "color_update_start",
+                "gen": gen,
+                "n": n,
+                "n_chunks": n_chunks,
+                "chunk_n": chunk_n,
+            }
+        )
+        for i in range(n_chunks):
+            a = i * chunk_n
+            b = min(a + chunk_n, n)
+            self.send(
+                {"type": "color_update_chunk", "gen": gen, "i": i, "a": a, "b": b},
+                buffers=[codes[a:b].tobytes()],
+            )
+        self.send({"type": "color_update_finalize", "gen": gen})
 
     def _on_custom_msg(self, _widget: Any, content: dict[str, Any], buffers: list) -> None:
         msg_type = content.get("type")

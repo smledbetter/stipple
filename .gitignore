@@ -30,3 +30,6 @@ scripts/*.png
 scripts/g*-result.png
 scripts/ex-*.png
 scripts/sticky-*.png
+
+# Demo recordings — binary MP4/WebM outputs, regenerable
+scripts/recordings/

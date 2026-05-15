@@ -12172,6 +12172,7 @@ adapter: ${adapterInfo}`);
       });
     }
     let stream = null;
+    let colorUpdateStream = null;
     async function handleDataStart(msg, paletteBuffer) {
       if (stream) {
         stream.transientPosBuf?.destroy();
@@ -12494,6 +12495,52 @@ FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · ` + (s.mode === "densit
         void handleDataFinalize(
           msg
         ).catch((e) => fail("decode-error", String(e), "data_finalize threw"));
+        return;
+      }
+      if (msg.type === "color_update") {
+        if (!state || !buffers || buffers.length === 0) return;
+        const bytes = bufferToBytes(buffers[0]);
+        const codes = new Uint32Array(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength / 4
+        );
+        writeBuf(state.colorBuf, 0, codes);
+        requestRender();
+        return;
+      }
+      if (msg.type === "color_update_start") {
+        const m = msg;
+        colorUpdateStream = {
+          gen: m.gen,
+          n: m.n,
+          codes: new Uint32Array(m.n)
+        };
+        return;
+      }
+      if (msg.type === "color_update_chunk") {
+        const m = msg;
+        if (!colorUpdateStream || colorUpdateStream.gen !== m.gen || !buffers || buffers.length === 0) {
+          return;
+        }
+        const bytes = bufferToBytes(buffers[0]);
+        const chunk = new Uint32Array(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength / 4
+        );
+        colorUpdateStream.codes.set(chunk, m.a);
+        return;
+      }
+      if (msg.type === "color_update_finalize") {
+        const m = msg;
+        if (!state || !colorUpdateStream || colorUpdateStream.gen !== m.gen) {
+          colorUpdateStream = null;
+          return;
+        }
+        writeBuf(state.colorBuf, 0, colorUpdateStream.codes);
+        requestRender();
+        colorUpdateStream = null;
         return;
       }
       if (msg.type !== "data") return;
