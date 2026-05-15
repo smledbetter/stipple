@@ -1,5 +1,14 @@
 import { tableFromIPC } from "apache-arrow";
-import { SCATTER_WGSL, LASSO_COMPUTE_WGSL, TAB10, BRAND_BLUE } from "./shaders";
+import {
+  SCATTER_WGSL,
+  LASSO_COMPUTE_WGSL,
+  MASK_CLEAR_WGSL,
+  GRID_COUNT_WGSL,
+  GRID_SCATTER_WGSL,
+  HOVER_QUERY_WGSL,
+  HOVER_GRID_CELL_N,
+  BRAND_BLUE,
+} from "./shaders";
 
 interface Model {
   get<T = unknown>(key: string): T;
@@ -34,11 +43,13 @@ function makeCanvasStack(width: number, height: number): {
   wrap: HTMLDivElement;
   gpuCanvas: HTMLCanvasElement;
   overlay: HTMLCanvasElement;
+  tooltip: HTMLDivElement;
 } {
   const dpr = window.devicePixelRatio || 1;
   const wrap = document.createElement("div");
   wrap.style.position = "relative";
   wrap.style.display = "inline-block";
+  wrap.setAttribute("data-stipple-role", "wrap");
 
   const gpuCanvas = document.createElement("canvas");
   gpuCanvas.width = Math.round(width * dpr);
@@ -50,6 +61,7 @@ function makeCanvasStack(width: number, height: number): {
   gpuCanvas.style.background = "#0d1117";
   gpuCanvas.style.cursor = "grab";
   gpuCanvas.style.touchAction = "none";
+  gpuCanvas.setAttribute("data-stipple-role", "render");
 
   const overlay = document.createElement("canvas");
   overlay.width = Math.round(width * dpr);
@@ -60,10 +72,25 @@ function makeCanvasStack(width: number, height: number): {
   overlay.style.top = "0";
   overlay.style.left = "0";
   overlay.style.pointerEvents = "none";
+  overlay.setAttribute("data-stipple-role", "overlay");
+
+  const tooltip = document.createElement("div");
+  tooltip.style.position = "absolute";
+  tooltip.style.pointerEvents = "none";
+  tooltip.style.background = "rgba(20, 22, 28, 0.92)";
+  tooltip.style.color = "#fff";
+  tooltip.style.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  tooltip.style.padding = "4px 7px";
+  tooltip.style.borderRadius = "3px";
+  tooltip.style.whiteSpace = "pre";
+  tooltip.style.display = "none";
+  tooltip.style.zIndex = "3";
+  tooltip.setAttribute("data-stipple-role", "tooltip");
 
   wrap.appendChild(gpuCanvas);
   wrap.appendChild(overlay);
-  return { wrap, gpuCanvas, overlay };
+  wrap.appendChild(tooltip);
+  return { wrap, gpuCanvas, overlay, tooltip };
 }
 
 function bufferToBytes(buf: ArrayBuffer | ArrayBufferView): Uint8Array {
@@ -101,7 +128,7 @@ export default {
     el.style.fontFamily = "system-ui, -apple-system, sans-serif";
 
     const status = makeStatusEl();
-    const { wrap, gpuCanvas, overlay } = makeCanvasStack(640, 640);
+    const { wrap, gpuCanvas, overlay, tooltip } = makeCanvasStack(640, 640);
     el.appendChild(status);
     el.appendChild(wrap);
 
@@ -181,7 +208,11 @@ export default {
     });
 
     const ubo = device.createBuffer({
-      size: 32,
+      // 8 f32 of payload (viewport, point_size, palette_n, view_translate,
+      // view_scale) + selection_dim + has_selection + 2 pad floats = 48 bytes.
+      // Uniform buffers must be a multiple of 16 bytes; WGSL pads the struct
+      // up to that boundary, and the host buffer must match.
+      size: 48,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -190,6 +221,48 @@ export default {
     const computePipeline = device.createComputePipeline({
       layout: "auto",
       compute: { module: computeShader, entryPoint: "cs" },
+    });
+
+    // -------- Mask-clear compute pipeline --------
+    // Zeroes the selection mask before each lasso. Cheap (~1–2 ms at 10M).
+    const maskClearShader = device.createShaderModule({ code: MASK_CLEAR_WGSL });
+    const maskClearPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: maskClearShader, entryPoint: "cs" },
+    });
+
+    // -------- Hover-index compute pipelines (build + query) --------
+    const gridCountShader = device.createShaderModule({ code: GRID_COUNT_WGSL });
+    const gridCountPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: gridCountShader, entryPoint: "cs" },
+    });
+    const gridScatterShader = device.createShaderModule({ code: GRID_SCATTER_WGSL });
+    const gridScatterPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: gridScatterShader, entryPoint: "cs" },
+    });
+    const hoverQueryShader = device.createShaderModule({ code: HOVER_QUERY_WGSL });
+    const hoverQueryPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: hoverQueryShader, entryPoint: "cs" },
+    });
+
+    const CELL_N = HOVER_GRID_CELL_N;
+    const CELL_TOTAL = CELL_N * CELL_N;
+    // Reusable buffers for hover-query result (8 bytes: dist² u32, idx u32).
+    const queryOut = device.createBuffer({
+      size: 8,
+      usage:
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const queryStaging = device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const queryUbo = device.createBuffer({
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
     const polygonBuf = device.createBuffer({
@@ -218,6 +291,9 @@ export default {
       paletteN: number;
       bindGroup: GPUBindGroup;
       computeBindGroup: GPUBindGroup;
+      maskClearBindGroup: GPUBindGroup;
+      maskClearUbo: GPUBuffer;
+      selectionMask: GPUBuffer;
       outIndices: GPUBuffer;
       outStaging: GPUBuffer;
       pointSize: number;
@@ -225,6 +301,16 @@ export default {
       viewTy: number;
       viewSx: number;
       viewSy: number;
+      hasSelection: boolean;
+      // Hover index (built async after uploadState returns)
+      positionsCpu: Float32Array;
+      gridReady: boolean;
+      gridOrigin: [number, number];
+      gridInvCell: [number, number];
+      cellStartBuf: GPUBuffer;
+      cellCountBuf: GPUBuffer;
+      pointIdsBuf: GPUBuffer;
+      hoverQueryBindGroup: GPUBindGroup;
     };
     let state: State | null = null;
 
@@ -235,6 +321,7 @@ export default {
     ): State {
       const n = positions.length / 2;
       const paletteN = paletteRGBA.length / 4;
+      const positionsCpu = positions;
 
       const posBuf = device.createBuffer({
         size: positions.byteLength,
@@ -254,6 +341,13 @@ export default {
       });
       writeBuf(paletteBuf, 0, paletteRGBA);
 
+      // Per-point selection mask (1 = in current selection, 0 = not).
+      // Initialised to zero by the GPU when created.
+      const selectionMask = device.createBuffer({
+        size: Math.max(4, n * 4),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+
       const bindGroup = device.createBindGroup({
         layout: renderPipeline.getBindGroupLayout(0),
         entries: [
@@ -261,6 +355,7 @@ export default {
           { binding: 1, resource: { buffer: posBuf } },
           { binding: 2, resource: { buffer: colorBuf } },
           { binding: 3, resource: { buffer: paletteBuf } },
+          { binding: 4, resource: { buffer: selectionMask } },
         ],
       });
 
@@ -282,10 +377,56 @@ export default {
           { binding: 2, resource: { buffer: counterBuf } },
           { binding: 3, resource: { buffer: outIndices } },
           { binding: 4, resource: { buffer: lassoUbo } },
+          { binding: 5, resource: { buffer: selectionMask } },
+        ],
+      });
+
+      const maskClearUbo = device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      writeBuf(maskClearUbo, 0, new Uint32Array([n, 0, 0, 0]));
+      const maskClearBindGroup = device.createBindGroup({
+        layout: maskClearPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: selectionMask } },
+          { binding: 1, resource: { buffer: maskClearUbo } },
         ],
       });
 
       const pointSize = n > 1_000_000 ? 1.2 : n > 100_000 ? 1.8 : n > 10_000 ? 2.5 : 5.0;
+
+      // -------- Hover-index buffers (data filled by buildHoverGrid below) --
+      const cellStartBuf = device.createBuffer({
+        size: CELL_TOTAL * 4,
+        usage:
+          GPUBufferUsage.STORAGE |
+          GPUBufferUsage.COPY_DST |
+          GPUBufferUsage.COPY_SRC,
+      });
+      const cellCountBuf = device.createBuffer({
+        size: CELL_TOTAL * 4,
+        usage:
+          GPUBufferUsage.STORAGE |
+          GPUBufferUsage.COPY_DST |
+          GPUBufferUsage.COPY_SRC,
+      });
+      const pointIdsBuf = device.createBuffer({
+        size: Math.max(4, n * 4),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+
+      const hoverQueryBindGroup = device.createBindGroup({
+        layout: hoverQueryPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: posBuf } },
+          { binding: 1, resource: { buffer: cellStartBuf } },
+          { binding: 2, resource: { buffer: cellCountBuf } },
+          { binding: 3, resource: { buffer: pointIdsBuf } },
+          { binding: 4, resource: { buffer: queryUbo } },
+          { binding: 5, resource: { buffer: queryOut } },
+        ],
+      });
 
       return {
         n,
@@ -295,6 +436,9 @@ export default {
         paletteN,
         bindGroup,
         computeBindGroup,
+        maskClearBindGroup,
+        maskClearUbo,
+        selectionMask,
         outIndices,
         outStaging,
         pointSize,
@@ -302,7 +446,130 @@ export default {
         viewTy: 0,
         viewSx: 1,
         viewSy: 1,
+        hasSelection: false,
+        positionsCpu,
+        gridReady: false,
+        gridOrigin: [0, 0],
+        gridInvCell: [1, 1],
+        cellStartBuf,
+        cellCountBuf,
+        pointIdsBuf,
+        hoverQueryBindGroup,
       };
+    }
+
+    // Build the hover index grid. Two-pass (count + scatter) with a CPU
+    // prefix-sum sandwiched in the middle for the per-cell offsets. Runs
+    // once per upload; cost scales with n and is dwarfed by the IPC decode
+    // for the realistic sizes (1M–10M).
+    async function buildHoverGrid(s: State): Promise<void> {
+      // World bbox from CPU positions (cheap, single pass).
+      let xMin = Infinity;
+      let xMax = -Infinity;
+      let yMin = Infinity;
+      let yMax = -Infinity;
+      const p = s.positionsCpu;
+      for (let i = 0; i < p.length; i += 2) {
+        const xi = p[i];
+        const yi = p[i + 1];
+        if (xi < xMin) xMin = xi;
+        if (xi > xMax) xMax = xi;
+        if (yi < yMin) yMin = yi;
+        if (yi > yMax) yMax = yi;
+      }
+      // Pad bbox slightly so points at the edge don't fall outside cell 0/N-1
+      // after floating-point rounding.
+      const padX = ((xMax - xMin) || 1) * 1e-4;
+      const padY = ((yMax - yMin) || 1) * 1e-4;
+      xMin -= padX;
+      xMax += padX;
+      yMin -= padY;
+      yMax += padY;
+      const cellW = (xMax - xMin) / CELL_N;
+      const cellH = (yMax - yMin) / CELL_N;
+      const invCellX = cellW > 0 ? 1 / cellW : 1;
+      const invCellY = cellH > 0 ? 1 / cellH : 1;
+      s.gridOrigin = [xMin, yMin];
+      s.gridInvCell = [invCellX, invCellY];
+
+      const gridUbo = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      const gridHeader = new ArrayBuffer(32);
+      new Uint32Array(gridHeader, 0, 4).set([s.n, CELL_N, 0, 0]);
+      new Float32Array(gridHeader, 16, 4).set([xMin, yMin, invCellX, invCellY]);
+      writeBuf(gridUbo, 0, new Uint8Array(gridHeader));
+
+      // Scratch buffer for atomic counter during scatter pass.
+      const cellCursorBuf = device.createBuffer({
+        size: CELL_TOTAL * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      const cellCountStaging = device.createBuffer({
+        size: CELL_TOTAL * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+
+      // Zero count + cursor buffers, then dispatch the count pass.
+      const zeros = new Uint32Array(CELL_TOTAL);
+      writeBuf(s.cellCountBuf, 0, zeros);
+      writeBuf(cellCursorBuf, 0, zeros);
+
+      const countBindGroup = device.createBindGroup({
+        layout: gridCountPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: s.posBuf } },
+          { binding: 1, resource: { buffer: s.cellCountBuf } },
+          { binding: 2, resource: { buffer: gridUbo } },
+        ],
+      });
+
+      const enc1 = device.createCommandEncoder();
+      const pass1 = enc1.beginComputePass();
+      pass1.setPipeline(gridCountPipeline);
+      pass1.setBindGroup(0, countBindGroup);
+      pass1.dispatchWorkgroups(Math.ceil(s.n / 64));
+      pass1.end();
+      enc1.copyBufferToBuffer(s.cellCountBuf, 0, cellCountStaging, 0, CELL_TOTAL * 4);
+      device.queue.submit([enc1.finish()]);
+
+      await cellCountStaging.mapAsync(GPUMapMode.READ);
+      const counts = new Uint32Array(cellCountStaging.getMappedRange()).slice();
+      cellCountStaging.unmap();
+      cellCountStaging.destroy();
+
+      // CPU prefix sum → cell_start.
+      const starts = new Uint32Array(CELL_TOTAL);
+      let acc = 0;
+      for (let i = 0; i < CELL_TOTAL; i++) {
+        starts[i] = acc;
+        acc += counts[i];
+      }
+      writeBuf(s.cellStartBuf, 0, starts);
+
+      const scatterBindGroup = device.createBindGroup({
+        layout: gridScatterPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: s.posBuf } },
+          { binding: 1, resource: { buffer: s.cellStartBuf } },
+          { binding: 2, resource: { buffer: cellCursorBuf } },
+          { binding: 3, resource: { buffer: s.pointIdsBuf } },
+          { binding: 4, resource: { buffer: gridUbo } },
+        ],
+      });
+
+      const enc2 = device.createCommandEncoder();
+      const pass2 = enc2.beginComputePass();
+      pass2.setPipeline(gridScatterPipeline);
+      pass2.setBindGroup(0, scatterBindGroup);
+      pass2.dispatchWorkgroups(Math.ceil(s.n / 64));
+      pass2.end();
+      device.queue.submit([enc2.finish()]);
+
+      cellCursorBuf.destroy();
+      gridUbo.destroy();
+      s.gridReady = true;
     }
 
     function fitView(positions: Float32Array, s: State) {
@@ -331,6 +598,7 @@ export default {
 
     function renderFrame() {
       if (!state) return;
+      const dim = Math.min(1.0, Math.max(0.0, model.get<number>("selection_dim") ?? 0.4));
       const data = new Float32Array([
         gpuCanvas.width,
         gpuCanvas.height,
@@ -340,6 +608,10 @@ export default {
         state.viewTy,
         state.viewSx,
         state.viewSy,
+        dim,
+        state.hasSelection ? 1.0 : 0.0,
+        0.0,
+        0.0, // pad to 48-byte uniform buffer (16-aligned)
       ]);
       writeBuf(ubo, 0, data);
       const encoder = device.createCommandEncoder();
@@ -446,12 +718,21 @@ export default {
       writeBuf(counterBuf, 0, new Uint32Array([0]));
 
       const encoder = device.createCommandEncoder();
+
+      // First: zero the per-point selection mask from any prior lasso.
+      const clearPass = encoder.beginComputePass();
+      clearPass.setPipeline(maskClearPipeline);
+      clearPass.setBindGroup(0, state.maskClearBindGroup);
+      clearPass.dispatchWorkgroups(Math.ceil(state.n / 64));
+      clearPass.end();
+
+      // Then: lasso hit-test. Writes to out_indices + selection_mask.
       const pass = encoder.beginComputePass();
       pass.setPipeline(computePipeline);
       pass.setBindGroup(0, state.computeBindGroup);
-      const wg = Math.ceil(state.n / 64);
-      pass.dispatchWorkgroups(wg);
+      pass.dispatchWorkgroups(Math.ceil(state.n / 64));
       pass.end();
+
       encoder.copyBufferToBuffer(counterBuf, 0, counterStaging, 0, 4);
       encoder.copyBufferToBuffer(state.outIndices, 0, state.outStaging, 0, state.n * 4);
       device.queue.submit([encoder.finish()]);
@@ -467,6 +748,18 @@ export default {
       state.outStaging.unmap();
 
       const ms = performance.now() - tStart;
+      state.hasSelection = true;
+      // Burst several RAFs so the post-lasso frame is presented before the
+      // page settles — a single RAF-debounced render sometimes never reaches
+      // the compositor, leaving stale pixels in screenshots.
+      let bursts = 5;
+      const burst = () => {
+        if (bursts-- <= 0) return;
+        renderFrame();
+        requestAnimationFrame(burst);
+      };
+      burst();
+
       // Send to Python. Copy into a fresh ArrayBuffer to ensure ownership.
       const out = new Uint32Array(slice);
       model.send({ type: "selection", ms, count }, undefined, [out.buffer]);
@@ -563,6 +856,99 @@ export default {
     gpuCanvas.addEventListener("pointerup", endPointer);
     gpuCanvas.addEventListener("pointercancel", endPointer);
 
+    // -------- Hover tooltip --------
+    let queryInflight = false;
+    let lastHoverPx: { x: number; y: number } | null = null;
+    let hoverShouldShow = false;
+    const hideTooltip = () => {
+      tooltip.style.display = "none";
+      hoverShouldShow = false;
+    };
+
+    function queryHover(clientX: number, clientY: number) {
+      if (!state || !state.gridReady) return;
+      if (lassoMode !== "idle" || panning) return;
+      const rect = gpuCanvas.getBoundingClientRect();
+      const lx = clientX - rect.left;
+      const ly = clientY - rect.top;
+      if (lx < 0 || ly < 0 || lx > rect.width || ly > rect.height) {
+        hideTooltip();
+        return;
+      }
+      lastHoverPx = { x: lx, y: ly };
+      if (queryInflight) return; // a later mousemove will trigger another
+      queryInflight = true;
+      hoverShouldShow = true;
+
+      const [wx, wy] = screenToWorld(clientX, clientY);
+      const header = new ArrayBuffer(48);
+      new Float32Array(header, 0, 2).set([wx, wy]);
+      new Uint32Array(header, 8, 2).set([CELL_N, 1]); // radius_cells = 1 → 3x3
+      new Float32Array(header, 16, 4).set([
+        state.gridOrigin[0],
+        state.gridOrigin[1],
+        state.gridInvCell[0],
+        state.gridInvCell[1],
+      ]);
+      writeBuf(queryUbo, 0, new Uint8Array(header));
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(hoverQueryPipeline);
+      pass.setBindGroup(0, state.hoverQueryBindGroup);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      enc.copyBufferToBuffer(queryOut, 0, queryStaging, 0, 8);
+      device.queue.submit([enc.finish()]);
+
+      // Pixel threshold → world distance². Use the current view scale.
+      const thresholdPx = 14;
+      const worldPerPxX = 2 / rect.width / state.viewSx;
+      const worldPerPxY = 2 / rect.height / state.viewSy;
+      const worldThresh = Math.max(
+        thresholdPx * Math.abs(worldPerPxX),
+        thresholdPx * Math.abs(worldPerPxY),
+      );
+      const threshSq = worldThresh * worldThresh;
+
+      void queryStaging.mapAsync(GPUMapMode.READ).then(() => {
+        const r = new Uint32Array(queryStaging.getMappedRange()).slice();
+        queryStaging.unmap();
+        queryInflight = false;
+        if (!state || !hoverShouldShow || !lastHoverPx) return;
+        const d2 = new Float32Array(r.buffer, 0, 1)[0];
+        const idx = r[1];
+        if (idx === 0xffffffff || !isFinite(d2) || d2 > threshSq) {
+          hideTooltip();
+          return;
+        }
+        const px = state.positionsCpu[idx * 2];
+        const py = state.positionsCpu[idx * 2 + 1];
+        const lines = [
+          `row: ${idx.toLocaleString()}`,
+          `x: ${px.toFixed(4)}`,
+          `y: ${py.toFixed(4)}`,
+        ];
+        tooltip.textContent = lines.join("\n");
+        tooltip.style.display = "block";
+        // Position slightly offset from cursor so it doesn't sit under the pointer.
+        const tx = Math.min(rect.width - 12, lastHoverPx.x + 12);
+        const ty = Math.min(rect.height - 12, lastHoverPx.y + 12);
+        tooltip.style.left = `${tx}px`;
+        tooltip.style.top = `${ty}px`;
+      });
+    }
+
+    gpuCanvas.addEventListener("pointermove", (e) => {
+      if (!state) return;
+      if (lassoMode !== "idle" || panning) {
+        hideTooltip();
+        return;
+      }
+      queryHover(e.clientX, e.clientY);
+    });
+    gpuCanvas.addEventListener("pointerleave", hideTooltip);
+
     gpuCanvas.addEventListener(
       "wheel",
       (e) => {
@@ -579,6 +965,7 @@ export default {
         state.viewTx = worldX - sx / state.viewSx;
         state.viewTy = worldY - sy / state.viewSy;
         if (lassoMode === "committed") clearLassoOverlay();
+        hideTooltip();
         requestRender();
       },
       { passive: false },
@@ -637,23 +1024,27 @@ export default {
           }
 
           let colorCodes: Uint32Array;
-          let paletteRGBA: Float32Array;
-          const cats = model.get<unknown[]>("color_categories") ?? [];
-          if (colorCol && cats.length > 0) {
+          if (colorCol) {
             const raw = colorCol.toArray();
             colorCodes =
               raw instanceof Uint32Array ? raw : new Uint32Array(raw as ArrayLike<number>);
-            const k = Math.max(1, cats.length);
-            paletteRGBA = new Float32Array(k * 4);
-            for (let i = 0; i < k; i++) {
-              const rgb = TAB10[i % TAB10.length];
-              paletteRGBA[i * 4 + 0] = rgb[0];
-              paletteRGBA[i * 4 + 1] = rgb[1];
-              paletteRGBA[i * 4 + 2] = rgb[2];
-              paletteRGBA[i * 4 + 3] = 1.0;
-            }
           } else {
             colorCodes = new Uint32Array(n);
+          }
+
+          // Palette ships from Python as buffers[1] (Kx4 float32 RGBA).
+          // Falls back to brand blue if a previous-version Python omits it.
+          let paletteRGBA: Float32Array;
+          if (buffers.length > 1 && buffers[1]) {
+            const palBytes = bufferToBytes(buffers[1]);
+            const f32 = new Float32Array(
+              palBytes.buffer,
+              palBytes.byteOffset,
+              palBytes.byteLength / 4,
+            );
+            // Copy so we don't share the backing ArrayBuffer with the comm message.
+            paletteRGBA = new Float32Array(f32);
+          } else {
             paletteRGBA = new Float32Array([
               BRAND_BLUE[0],
               BRAND_BLUE[1],
@@ -661,7 +1052,6 @@ export default {
               1.0,
             ]);
           }
-
           const tUpload0 = performance.now();
           state = uploadState(positions, colorCodes, paletteRGBA);
           fitView(positions, state);
@@ -669,6 +1059,12 @@ export default {
 
           renderFrame();
           const tRender = performance.now() - tUpload1;
+          // Build the hover grid asynchronously — tooltip stays disabled
+          // until gridReady flips true, which is a few ms after first render.
+          void buildHoverGrid(state).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.warn("[stipple] hover grid build failed:", err);
+          });
 
           model.set("rows_received", n);
           model.set("bytes_received", bytes.byteLength);
@@ -682,10 +1078,20 @@ export default {
 
           const mb = (bytes.byteLength / (1024 * 1024)).toFixed(2);
           const totalMs = (performance.now() - tStart).toFixed(0);
+          const cats = model.get<unknown[]>("color_categories") ?? [];
+          const range = model.get<number[]>("color_range") ?? [];
+          let colorLine: string;
+          if (range.length === 2) {
+            colorLine = `continuous color [${range[0].toFixed(3)}, ${range[1].toFixed(3)}]`;
+          } else if (cats.length > 0) {
+            colorLine = `${cats.length} class${cats.length === 1 ? "" : "es"}`;
+          } else {
+            colorLine = "single color";
+          }
           log(
-            `✓ Stipple — ${n.toLocaleString()} rows · ${cats.length || 1} class${(cats.length || 1) === 1 ? "" : "es"}\n` +
+            `✓ Stipple — ${n.toLocaleString()} rows · ${colorLine}\n` +
               `Arrow IPC: ${mb} MB · decode: ${(tDecode1 - tDecode0).toFixed(1)} ms · upload: ${(tUpload1 - tUpload0).toFixed(1)} ms · first render: ${tRender.toFixed(1)} ms\n` +
-              `FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · shift+drag to lasso · drag to pan · wheel to zoom\n` +
+              `FPS: ${fps.toFixed(1)} (frame ${avgMs.toFixed(2)} ms) · shift+drag to lasso · drag to pan · wheel to zoom · re-run the next cell to inspect\n` +
               `total: ${totalMs} ms · adapter: ${adapterInfo}`,
           );
         } catch (e) {

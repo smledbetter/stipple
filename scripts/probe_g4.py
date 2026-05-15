@@ -104,7 +104,7 @@ def run_probe(headed: bool = False) -> dict:
             )
             ctx = browser.new_context(viewport={"width": 1400, "height": 1100})
             page = ctx.new_page()
-            page.on("console", lambda m: print(f"[console] {m.type}: {m.text}"))
+            page.on("console", lambda m: print(f"[console] {m.type}: {m.text}") if m.type in ("error", "warning") else None)
             page.on("pageerror", lambda e: print(f"[pageerror] {e}"))
 
             url = f"http://127.0.0.1:{port}/lab/tree/{NOTEBOOK}?token={TOKEN}"

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anywidget
 import numpy as np
 import pyarrow as pa
 import traitlets
+
+from . import _palettes
 
 _STATIC = Path(__file__).parent / "_static"
 
@@ -16,14 +18,33 @@ class Stipple(anywidget.AnyWidget):
 
     Examples
     --------
-    Minimal:
+    Bare arrays:
 
         w = Stipple(x=xs, y=ys)
 
-    Colored by a categorical label:
+    DataFrame columns by name (pandas / polars / pyarrow.Table / dict):
+
+        w = Stipple(df, x="col_x", y="col_y", color="col_c")
+
+    Categorical color (default tab10):
 
         w = Stipple(x=xs, y=ys, color=labels)
-        w.color_categories   # list mapping category index -> label
+        w.color_categories  # category index -> label
+
+    Continuous color (default viridis):
+
+        w = Stipple(x=xs, y=ys, color=losses, color_kind="continuous")
+        w.color_range  # [vmin, vmax] used for the colormap
+
+    Custom palette:
+
+        # Built-in named (matplotlib colormap name if matplotlib installed,
+        # otherwise one of: viridis, plasma, magma, inferno, tab10)
+        w = Stipple(x=xs, y=ys, color=losses, color_kind="continuous",
+                    color_palette="plasma")
+        # Or pass an (N, 3) / (N, 4) numpy array in [0, 1]:
+        my_palette = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        w = Stipple(x=xs, y=ys, color=labels, color_palette=my_palette)
 
     Lasso selection (shift+drag in the canvas):
 
@@ -45,37 +66,61 @@ class Stipple(anywidget.AnyWidget):
     avg_frame_ms = traitlets.Float(0.0).tag(sync=True)
     last_fps = traitlets.Float(0.0).tag(sync=True)
 
+    # Categorical: list of original category labels in code-index order.
+    # Continuous: empty (use color_range instead).
     color_categories = traitlets.List(default_value=[]).tag(sync=True)
+    # Continuous: [vmin, vmax] used to normalize before quantization.
+    # Categorical: empty.
+    color_range = traitlets.List(default_value=[]).tag(sync=True)
 
     selection_count = traitlets.Int(0).tag(sync=True)
     selection_ms = traitlets.Float(0.0).tag(sync=True)
+    # When a lasso selection is active, unselected points render at this
+    # fraction of their full alpha (0.0–1.0). Default 0.4 = ~halfway dim.
+    # Bump toward 1.0 to disable the dim effect entirely.
+    selection_dim = traitlets.Float(0.4).tag(sync=True)
 
     def __init__(
         self,
+        data: Any = None,
         *,
         x: Any = None,
         y: Any = None,
         color: Any = None,
+        color_kind: Literal["categorical", "continuous"] | None = None,
+        color_palette: str | np.ndarray | Any = "auto",
+        vmin: float | None = None,
+        vmax: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._pending_ipc: bytes | None = None
+        self._pending_palette: bytes | None = None
         self._selected_indices: np.ndarray = np.empty(0, dtype=np.uint32)
-        # NOTE: don't override `_handle_msg` — that name is reserved by
-        # ipywidgets.Widget for the comm dispatcher. Register our handler
-        # via on_msg so ipywidgets routes only custom messages to us.
         self.on_msg(self._on_custom_msg)
-        if x is not None or y is not None:
+        if data is not None:
+            x_arr, y_arr, color_arr = _extract_columns(data, x, y, color)
+            self._stage(x_arr, y_arr, color_arr, color_kind, color_palette, vmin, vmax)
+        elif x is not None or y is not None:
             if x is None or y is None:
                 raise ValueError("Stipple needs both x and y, or neither.")
-            self._stage(x, y, color)
+            self._stage(x, y, color, color_kind, color_palette, vmin, vmax)
 
     @property
     def selected_indices(self) -> np.ndarray:
         """Row indices most recently lassoed in the widget (uint32)."""
         return self._selected_indices
 
-    def _stage(self, x: Any, y: Any, color: Any) -> None:
+    def _stage(
+        self,
+        x: Any,
+        y: Any,
+        color: Any,
+        color_kind: str | None,
+        color_palette: Any,
+        vmin: float | None,
+        vmax: float | None,
+    ) -> None:
         x_arr = np.ascontiguousarray(np.asarray(x, dtype=np.float32))
         y_arr = np.ascontiguousarray(np.asarray(y, dtype=np.float32))
         if x_arr.ndim != 1 or y_arr.ndim != 1:
@@ -83,26 +128,59 @@ class Stipple(anywidget.AnyWidget):
         if x_arr.shape != y_arr.shape:
             raise ValueError(f"x and y length mismatch: {x_arr.shape[0]} vs {y_arr.shape[0]}.")
 
+        n = int(x_arr.shape[0])
         columns: dict[str, np.ndarray] = {"x": x_arr, "y": y_arr}
+        palette_rgba: np.ndarray  # (K, 4) float32
 
-        if color is not None:
+        if color is None:
+            codes = np.zeros(n, dtype=np.uint32)
+            palette_rgba = np.array([[0.20, 0.55, 0.95, 1.0]], dtype=np.float32)
+            columns["color"] = codes
+            self.color_categories = []
+            self.color_range = []
+        else:
             color_arr = np.asarray(color)
-            if color_arr.ndim != 1 or color_arr.shape[0] != x_arr.shape[0]:
+            if color_arr.ndim != 1 or color_arr.shape[0] != n:
                 raise ValueError(
                     f"color must be 1-D with same length as x/y; got {color_arr.shape}."
                 )
-            codes, cats = _factorize_to_codes(color_arr)
+
+            kind = color_kind if color_kind in ("categorical", "continuous") else _infer_color_kind(color_arr)
+            if kind not in ("categorical", "continuous"):
+                raise ValueError(f"color_kind must be 'categorical' or 'continuous'; got {color_kind!r}.")
+
+            pal_arg = color_palette
+            if isinstance(pal_arg, str) and pal_arg == "auto":
+                pal_arg = "viridis" if kind == "continuous" else "tab10"
+            palette_rgba = _palettes.resolve_palette(pal_arg, want_continuous=(kind == "continuous"))
+
+            if kind == "continuous":
+                v = color_arr.astype(np.float32)
+                finite = v[np.isfinite(v)]
+                lo = float(vmin) if vmin is not None else (float(finite.min()) if finite.size else 0.0)
+                hi = float(vmax) if vmax is not None else (float(finite.max()) if finite.size else 1.0)
+                span = max(hi - lo, 1e-12)
+                normalized = np.clip((v - lo) / span, 0.0, 1.0)
+                palette_n = int(palette_rgba.shape[0])
+                codes = np.clip(
+                    np.rint(normalized * (palette_n - 1)), 0, palette_n - 1
+                ).astype(np.uint32)
+                self.color_categories = []
+                self.color_range = [lo, hi]
+            else:  # categorical
+                codes, cats = _factorize_to_codes(color_arr)
+                self.color_categories = [_to_jsonable(c) for c in cats]
+                self.color_range = []
+
             columns["color"] = codes
-            self.color_categories = [_to_jsonable(c) for c in cats]
-        else:
-            self.color_categories = []
 
         table = pa.table(columns)
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, table.schema) as writer:
             writer.write_table(table)
         self._pending_ipc = sink.getvalue().to_pybytes()
-        self.n_points = int(x_arr.shape[0])
+        self._pending_palette = np.ascontiguousarray(palette_rgba, dtype=np.float32).tobytes()
+        self.n_points = n
 
         if self.client_ready:
             self._push()
@@ -115,9 +193,14 @@ class Stipple(anywidget.AnyWidget):
     def _push(self) -> None:
         if self._pending_ipc is None:
             return
-        payload = self._pending_ipc
+        ipc = self._pending_ipc
+        pal = self._pending_palette
         self._pending_ipc = None
-        self.send({"type": "data"}, buffers=[payload])
+        self._pending_palette = None
+        buffers: list[bytes] = [ipc]
+        if pal is not None:
+            buffers.append(pal)
+        self.send({"type": "data"}, buffers=buffers)
 
     def _on_custom_msg(self, _widget: Any, content: dict[str, Any], buffers: list) -> None:
         if content.get("type") != "selection":
@@ -131,6 +214,60 @@ class Stipple(anywidget.AnyWidget):
             self._selected_indices = arr
         self.selection_count = self.selection_count + 1
         self.selection_ms = float(content.get("ms") or 0.0)
+
+
+def _extract_columns(
+    data: Any, x: Any, y: Any, color: Any
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Resolve column-name args against a DataFrame-like object.
+
+    Accepts pandas DataFrames, polars DataFrames, pyarrow Tables, and plain
+    dicts of array-likes. x/y must be string column names; color may be a
+    column name or None.
+    """
+    if not isinstance(x, str) or not isinstance(y, str):
+        raise ValueError(
+            "When passing a DataFrame as the first argument, x and y must "
+            "be column-name strings, e.g. Stipple(df, x='col_a', y='col_b')."
+        )
+    if color is not None and not isinstance(color, str):
+        raise ValueError(
+            "When passing a DataFrame, color must be a column-name string "
+            "(or None to skip)."
+        )
+    names = [x, y] + ([color] if color is not None else [])
+    cols = _columns_to_numpy(data, names)
+    return cols[x], cols[y], cols[color] if color is not None else None
+
+
+def _columns_to_numpy(data: Any, names: list[str]) -> dict[str, np.ndarray]:
+    if isinstance(data, pa.Table):
+        return {n: data.column(n).to_numpy(zero_copy_only=False) for n in names}
+    if hasattr(data, "__arrow_c_stream__"):
+        # Arrow PyCapsule (pandas >= 2.2, polars >= 0.20, ...). pa.table picks
+        # this up automatically and avoids per-column object conversions.
+        tbl = pa.table(data)
+        return {n: tbl.column(n).to_numpy(zero_copy_only=False) for n in names}
+    if hasattr(data, "to_arrow"):
+        # Older polars releases predate the PyCapsule interface.
+        tbl = data.to_arrow()
+        return {n: tbl.column(n).to_numpy(zero_copy_only=False) for n in names}
+    if isinstance(data, dict):
+        return {n: np.asarray(data[n]) for n in names}
+    if hasattr(data, "columns") and hasattr(data, "__getitem__"):
+        # Last-resort pandas-style duck typing.
+        return {n: np.asarray(data[n]) for n in names}
+    raise TypeError(
+        f"Stipple doesn't recognize this data type: {type(data).__name__}. "
+        "Pass a pandas/polars DataFrame, pyarrow.Table, or dict of arrays."
+    )
+
+
+def _infer_color_kind(arr: np.ndarray) -> str:
+    """Categorical for bool/int dtypes, continuous for float."""
+    if arr.dtype.kind in ("f",):
+        return "continuous"
+    return "categorical"
 
 
 def _factorize_to_codes(arr: np.ndarray) -> tuple[np.ndarray, list[Any]]:
