@@ -10,6 +10,7 @@ import {
   DENSITY_BUILD_WGSL,
   DENSITY_RENDER_WGSL,
   DENSITY_BIN_N,
+  MAX_REDUCE_WGSL,
   BRAND_BLUE,
 } from "./shaders";
 
@@ -276,6 +277,13 @@ export default {
     const hoverQueryPipeline = device.createComputePipeline({
       layout: "auto",
       compute: { module: hoverQueryShader, entryPoint: "cs" },
+    });
+
+    // -------- Max-reduce pipeline (used by progressive density renders) ---
+    const maxReduceShader = device.createShaderModule({ code: MAX_REDUCE_WGSL });
+    const maxReducePipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: maxReduceShader, entryPoint: "cs" },
     });
 
     const CELL_N = HOVER_GRID_CELL_N;
@@ -1259,6 +1267,15 @@ export default {
       // Density-only render plumbing (allocated lazily at first chunk).
       densityRenderBindGroup?: GPUBindGroup;
       paletteBuf?: GPUBuffer;
+      // Progressive rendering (density-only): fast GPU max-reduce so we can
+      // update the colormap without a CPU readback over the whole bin grid.
+      progressiveK: number;
+      progressiveCount: number;
+      reduceInflight: boolean;
+      maxReduceUbo?: GPUBuffer;
+      maxReduceOutBuf?: GPUBuffer;
+      maxReduceStaging?: GPUBuffer;
+      maxReduceBindGroup?: GPUBindGroup;
     };
     let stream: StreamState | null = null;
 
@@ -1279,6 +1296,9 @@ export default {
         stream.densityBuildUbo?.destroy();
         stream.binCountBuf?.destroy();
         stream.paletteBuf?.destroy();
+        stream.maxReduceUbo?.destroy();
+        stream.maxReduceOutBuf?.destroy();
+        stream.maxReduceStaging?.destroy();
         stream = null;
       }
       const palBytes = bufferToBytes(paletteBuffer);
@@ -1301,7 +1321,16 @@ export default {
         paletteRGBA,
         tStart: performance.now(),
         bytesReceived: 0,
+        // Render progressively every K chunks. Target ~8 progressive frames
+        // total so 25-40 chunk streams get healthy mid-load feedback while
+        // small streams (≤8 chunks) update on every chunk.
+        progressiveK: Math.max(1, Math.ceil(msg.n_chunks / 8)),
+        progressiveCount: 0,
+        reduceInflight: false,
       };
+      // Reset the synced trait so multiple uploads don't accumulate.
+      model.set("progressive_renders", 0);
+      model.save_changes();
 
       if (msg.render_mode === "density-only") {
         // Allocate only the buffers we'll actually keep past finalize:
@@ -1414,6 +1443,32 @@ export default {
         new Uint32Array(hdr, 0, 4).set([0, BIN_N, 0, 0]); // n_points filled per chunk
         new Float32Array(hdr, 16, 4).set([origin[0], origin[1], invCell[0], invCell[1]]);
         writeBuf(stream.densityBuildUbo!, 0, new Uint8Array(hdr));
+
+        // Allocate max-reduce buffers for progressive renders.
+        stream.maxReduceUbo = device.createBuffer({
+          size: 16,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        writeBuf(stream.maxReduceUbo, 0, new Uint32Array([BIN_TOTAL, 0, 0, 0]));
+        stream.maxReduceOutBuf = device.createBuffer({
+          size: 4,
+          usage:
+            GPUBufferUsage.STORAGE |
+            GPUBufferUsage.COPY_DST |
+            GPUBufferUsage.COPY_SRC,
+        });
+        stream.maxReduceStaging = device.createBuffer({
+          size: 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        stream.maxReduceBindGroup = device.createBindGroup({
+          layout: maxReducePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: stream.binCountBuf! } },
+            { binding: 1, resource: { buffer: stream.maxReduceOutBuf } },
+            { binding: 2, resource: { buffer: stream.maxReduceUbo } },
+          ],
+        });
       } else {
         // scatter / density: accumulate the full data CPU-side, then build
         // state once at finalize using uploadState (same as single-shot).
@@ -1425,6 +1480,41 @@ export default {
         `⏳ Stipple — loading 0 / ${msg.n_chunks} chunks · ${msg.n.toLocaleString()} rows · mode=${msg.render_mode}\n` +
           `adapter: ${adapterInfo}`,
       );
+    }
+
+    // Progressive density render: run the GPU max-reduce on the current
+    // bin_count grid, read back the single u32 max, update log_max, render.
+    // Fire-and-forget during chunked streams (skip if a prior reduce is
+    // still in flight); awaited at finalize so the last frame is accurate.
+    async function progressiveRender(s: StreamState): Promise<void> {
+      if (s.reduceInflight) return;
+      if (!s.maxReduceBindGroup || !s.maxReduceOutBuf || !s.maxReduceStaging) {
+        return;
+      }
+      s.reduceInflight = true;
+      try {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(maxReducePipeline);
+        pass.setBindGroup(0, s.maxReduceBindGroup);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        enc.copyBufferToBuffer(s.maxReduceOutBuf, 0, s.maxReduceStaging, 0, 4);
+        device.queue.submit([enc.finish()]);
+
+        await s.maxReduceStaging.mapAsync(GPUMapMode.READ);
+        const maxVal = new Uint32Array(s.maxReduceStaging.getMappedRange())[0];
+        s.maxReduceStaging.unmap();
+
+        if (state && state.mode === "density-only") {
+          state.densityLogMax = Math.log(maxVal + 1);
+          state.densityReady = true;
+          renderFrame();
+          s.progressiveCount += 1;
+        }
+      } finally {
+        s.reduceInflight = false;
+      }
     }
 
     async function handleDataChunk(
@@ -1488,6 +1578,18 @@ export default {
       log(
         `⏳ Stipple — loading ${stream.received} / ${stream.nChunks} chunks · ${stream.n.toLocaleString()} rows · mode=${stream.mode}`,
       );
+
+      // Progressive render: in density-only mode, every K chunks the canvas
+      // visualizes the cumulative bin grid so the user sees clusters emerge
+      // rather than waiting on a dark canvas. handleDataFinalize fires the
+      // last render, so skip when this is the final chunk.
+      if (
+        stream.mode === "density-only" &&
+        stream.received < stream.nChunks &&
+        stream.received % stream.progressiveK === 0
+      ) {
+        void progressiveRender(stream);
+      }
     }
 
     async function handleDataFinalize(msg: { gen: number }): Promise<void> {
@@ -1496,29 +1598,18 @@ export default {
       stream = null;
 
       if (s.mode === "density-only") {
-        // Compute log_max via one readback of the accumulated bin grid.
-        const staging = device.createBuffer({
-          size: BIN_TOTAL * 4,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-        });
-        const enc = device.createCommandEncoder();
-        enc.copyBufferToBuffer(s.binCountBuf!, 0, staging, 0, BIN_TOTAL * 4);
-        device.queue.submit([enc.finish()]);
-        await staging.mapAsync(GPUMapMode.READ);
-        const counts = new Uint32Array(staging.getMappedRange());
-        let maxC = 0;
-        for (let i = 0; i < counts.length; i++) {
-          if (counts[i] > maxC) maxC = counts[i];
+        // Final render: GPU max-reduce → small u32 readback → render. If a
+        // progressive reduce is already in flight, wait it out so we don't
+        // submit two concurrent reduces against the same buffers.
+        while (s.reduceInflight) {
+          await new Promise((r) => setTimeout(r, 4));
         }
-        staging.unmap();
-        staging.destroy();
+        await progressiveRender(s);
         s.densityBuildUbo?.destroy();
-        // Transient positions buffer is no longer needed.
         s.transientPosBuf?.destroy();
-
-        state!.densityLogMax = Math.log(maxC + 1);
-        state!.densityReady = true;
-        renderFrame();
+        s.maxReduceUbo?.destroy();
+        s.maxReduceOutBuf?.destroy();
+        s.maxReduceStaging?.destroy();
       } else {
         // scatter / density: assemble State from the accumulated arrays.
         const positions = s.positions!;
@@ -1547,6 +1638,7 @@ export default {
       model.set("rows_received", s.n);
       model.set("bytes_received", s.bytesReceived);
       model.set("status", "data-rendered");
+      model.set("progressive_renders", s.progressiveCount);
       model.save_changes();
 
       const { avgMs, fps } = await benchmarkFPS(30);

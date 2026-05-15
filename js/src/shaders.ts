@@ -428,3 +428,46 @@ fn fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 `;
 
 export const DENSITY_BIN_N = 1024;
+
+// Single-workgroup max-reduction over the bin_count buffer. Used to get a
+// fast (~0.5 ms) log_max for progressive renders during chunked uploads,
+// without paying the ~10 ms CPU readback + linear scan over 4 MB.
+export const MAX_REDUCE_WGSL = /* wgsl */ `
+struct MaxUniforms { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+
+@group(0) @binding(0) var<storage, read> bin_count: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out_max: array<u32>;
+@group(0) @binding(2) var<uniform> mu: MaxUniforms;
+
+var<workgroup> wg_max: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn cs(@builtin(local_invocation_id) lid: vec3u) {
+  var m: u32 = 0u;
+  var i: u32 = lid.x;
+  loop {
+    if (i >= mu.n) { break; }
+    let v = bin_count[i];
+    if (v > m) { m = v; }
+    i = i + 256u;
+  }
+  wg_max[lid.x] = m;
+  workgroupBarrier();
+
+  var stride: u32 = 128u;
+  loop {
+    if (stride == 0u) { break; }
+    if (lid.x < stride) {
+      let a = wg_max[lid.x];
+      let b = wg_max[lid.x + stride];
+      if (b > a) { wg_max[lid.x] = b; }
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+
+  if (lid.x == 0u) {
+    out_max[0] = wg_max[0];
+  }
+}
+`;

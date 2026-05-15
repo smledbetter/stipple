@@ -80,6 +80,11 @@ class Stipple(anywidget.AnyWidget):
     # Bump toward 1.0 to disable the dim effect entirely.
     selection_dim = traitlets.Float(0.4).tag(sync=True)
 
+    # Count of intermediate density frames rendered during a chunked load
+    # (density-only mode). 0 for single-shot loads. > 1 means the canvas
+    # updated visually as chunks streamed in.
+    progressive_renders = traitlets.Int(0).tag(sync=True)
+
     # Render mode:
     #   "scatter"      — one anti-aliased disk per point (great up to ~10M).
     #   "density"      — 1024² bin grid heatmap, log(count) → palette. Pan/

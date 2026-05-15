@@ -11129,6 +11129,48 @@ fn fs(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 `
 );
 const DENSITY_BIN_N = 1024;
+const MAX_REDUCE_WGSL = (
+  /* wgsl */
+  `
+struct MaxUniforms { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+
+@group(0) @binding(0) var<storage, read> bin_count: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out_max: array<u32>;
+@group(0) @binding(2) var<uniform> mu: MaxUniforms;
+
+var<workgroup> wg_max: array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn cs(@builtin(local_invocation_id) lid: vec3u) {
+  var m: u32 = 0u;
+  var i: u32 = lid.x;
+  loop {
+    if (i >= mu.n) { break; }
+    let v = bin_count[i];
+    if (v > m) { m = v; }
+    i = i + 256u;
+  }
+  wg_max[lid.x] = m;
+  workgroupBarrier();
+
+  var stride: u32 = 128u;
+  loop {
+    if (stride == 0u) { break; }
+    if (lid.x < stride) {
+      let a = wg_max[lid.x];
+      let b = wg_max[lid.x + stride];
+      if (b > a) { wg_max[lid.x] = b; }
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+
+  if (lid.x == 0u) {
+    out_max[0] = wg_max[0];
+  }
+}
+`
+);
 
 function makeStatusEl() {
   const el = document.createElement("div");
@@ -11330,6 +11372,11 @@ const index = {
     const hoverQueryPipeline = device.createComputePipeline({
       layout: "auto",
       compute: { module: hoverQueryShader, entryPoint: "cs" }
+    });
+    const maxReduceShader = device.createShaderModule({ code: MAX_REDUCE_WGSL });
+    const maxReducePipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module: maxReduceShader, entryPoint: "cs" }
     });
     const CELL_N = HOVER_GRID_CELL_N;
     const CELL_TOTAL = CELL_N * CELL_N;
@@ -12110,6 +12157,9 @@ adapter: ${adapterInfo}`);
         stream.densityBuildUbo?.destroy();
         stream.binCountBuf?.destroy();
         stream.paletteBuf?.destroy();
+        stream.maxReduceUbo?.destroy();
+        stream.maxReduceOutBuf?.destroy();
+        stream.maxReduceStaging?.destroy();
         stream = null;
       }
       const palBytes = bufferToBytes(paletteBuffer);
@@ -12130,8 +12180,16 @@ adapter: ${adapterInfo}`);
         received: 0,
         paletteRGBA,
         tStart: performance.now(),
-        bytesReceived: 0
+        bytesReceived: 0,
+        // Render progressively every K chunks. Target ~8 progressive frames
+        // total so 25-40 chunk streams get healthy mid-load feedback while
+        // small streams (≤8 chunks) update on every chunk.
+        progressiveK: Math.max(1, Math.ceil(msg.n_chunks / 8)),
+        progressiveCount: 0,
+        reduceInflight: false
       };
+      model.set("progressive_renders", 0);
+      model.save_changes();
       if (msg.render_mode === "density-only") {
         stream.transientPosBuf = device.createBuffer({
           size: Math.max(8, msg.chunk_n * 8),
@@ -12228,6 +12286,27 @@ adapter: ${adapterInfo}`);
         new Uint32Array(hdr, 0, 4).set([0, BIN_N, 0, 0]);
         new Float32Array(hdr, 16, 4).set([origin[0], origin[1], invCell[0], invCell[1]]);
         writeBuf(stream.densityBuildUbo, 0, new Uint8Array(hdr));
+        stream.maxReduceUbo = device.createBuffer({
+          size: 16,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+        writeBuf(stream.maxReduceUbo, 0, new Uint32Array([BIN_TOTAL, 0, 0, 0]));
+        stream.maxReduceOutBuf = device.createBuffer({
+          size: 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+        });
+        stream.maxReduceStaging = device.createBuffer({
+          size: 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        stream.maxReduceBindGroup = device.createBindGroup({
+          layout: maxReducePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: stream.binCountBuf } },
+            { binding: 1, resource: { buffer: stream.maxReduceOutBuf } },
+            { binding: 2, resource: { buffer: stream.maxReduceUbo } }
+          ]
+        });
       } else {
         stream.positions = new Float32Array(msg.n * 2);
         stream.colorCodes = new Uint32Array(msg.n);
@@ -12236,6 +12315,34 @@ adapter: ${adapterInfo}`);
         `⏳ Stipple — loading 0 / ${msg.n_chunks} chunks · ${msg.n.toLocaleString()} rows · mode=${msg.render_mode}
 adapter: ${adapterInfo}`
       );
+    }
+    async function progressiveRender(s) {
+      if (s.reduceInflight) return;
+      if (!s.maxReduceBindGroup || !s.maxReduceOutBuf || !s.maxReduceStaging) {
+        return;
+      }
+      s.reduceInflight = true;
+      try {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(maxReducePipeline);
+        pass.setBindGroup(0, s.maxReduceBindGroup);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        enc.copyBufferToBuffer(s.maxReduceOutBuf, 0, s.maxReduceStaging, 0, 4);
+        device.queue.submit([enc.finish()]);
+        await s.maxReduceStaging.mapAsync(GPUMapMode.READ);
+        const maxVal = new Uint32Array(s.maxReduceStaging.getMappedRange())[0];
+        s.maxReduceStaging.unmap();
+        if (state && state.mode === "density-only") {
+          state.densityLogMax = Math.log(maxVal + 1);
+          state.densityReady = true;
+          renderFrame();
+          s.progressiveCount += 1;
+        }
+      } finally {
+        s.reduceInflight = false;
+      }
     }
     async function handleDataChunk(msg, ipcBuffer) {
       if (!stream || msg.gen !== stream.gen) return;
@@ -12285,32 +12392,24 @@ adapter: ${adapterInfo}`
       log(
         `⏳ Stipple — loading ${stream.received} / ${stream.nChunks} chunks · ${stream.n.toLocaleString()} rows · mode=${stream.mode}`
       );
+      if (stream.mode === "density-only" && stream.received < stream.nChunks && stream.received % stream.progressiveK === 0) {
+        void progressiveRender(stream);
+      }
     }
     async function handleDataFinalize(msg) {
       if (!stream || msg.gen !== stream.gen) return;
       const s = stream;
       stream = null;
       if (s.mode === "density-only") {
-        const staging = device.createBuffer({
-          size: BIN_TOTAL * 4,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-        });
-        const enc = device.createCommandEncoder();
-        enc.copyBufferToBuffer(s.binCountBuf, 0, staging, 0, BIN_TOTAL * 4);
-        device.queue.submit([enc.finish()]);
-        await staging.mapAsync(GPUMapMode.READ);
-        const counts = new Uint32Array(staging.getMappedRange());
-        let maxC = 0;
-        for (let i = 0; i < counts.length; i++) {
-          if (counts[i] > maxC) maxC = counts[i];
+        while (s.reduceInflight) {
+          await new Promise((r) => setTimeout(r, 4));
         }
-        staging.unmap();
-        staging.destroy();
+        await progressiveRender(s);
         s.densityBuildUbo?.destroy();
         s.transientPosBuf?.destroy();
-        state.densityLogMax = Math.log(maxC + 1);
-        state.densityReady = true;
-        renderFrame();
+        s.maxReduceUbo?.destroy();
+        s.maxReduceOutBuf?.destroy();
+        s.maxReduceStaging?.destroy();
       } else {
         const positions = s.positions;
         const colorCodes = s.colorCodes;
@@ -12334,6 +12433,7 @@ adapter: ${adapterInfo}`
       model.set("rows_received", s.n);
       model.set("bytes_received", s.bytesReceived);
       model.set("status", "data-rendered");
+      model.set("progressive_renders", s.progressiveCount);
       model.save_changes();
       const { avgMs, fps } = await benchmarkFPS(30);
       model.set("avg_frame_ms", avgMs);

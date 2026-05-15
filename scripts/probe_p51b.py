@@ -198,6 +198,9 @@ def run_probe(notebook: str, expected_n: int, slug: str, headed: bool, banner_ti
             m = re.search(r"bytes_recv\s*:\s*([\d.]+)\s*MB", print_out)
             if m:
                 result["bytes_recv_mb"] = float(m.group(1))
+            m = re.search(r"progressive\s*:\s*(\d+)", print_out)
+            if m:
+                result["progressive_renders"] = int(m.group(1))
 
             canvas = page.locator(
                 '.jp-OutputArea-output canvas[data-stipple-role="render"]'
@@ -244,11 +247,11 @@ def main() -> int:
     print(f"P5.1b PROBE — {args.notebook}")
     for k in (
         "render_mode", "rows", "fps", "frame_ms", "bytes_recv_mb",
-        "chunk_progress", "banner_done",
+        "progressive_renders", "chunk_progress", "banner_done",
         "rgb_center", "rgb_corner", "screenshot",
     ):
         if k in r:
-            print(f"  {k:<16}: {r[k]}")
+            print(f"  {k:<20}: {r[k]}")
     print("=" * 60)
 
     mode_ok = r.get("render_mode") == "density-only"
@@ -258,16 +261,18 @@ def main() -> int:
     center_bright = sum(r.get("rgb_center") or (0, 0, 0)) > 60.0
     corner_dark = sum(r.get("rgb_corner") or (255, 255, 255)) < 90.0
     done_ok = bool(r.get("banner_done"))
+    progressive_ok = (r.get("progressive_renders") or 0) > 1
 
     print(f"  mode == density-only: {mode_ok}")
     print(f"  rows == expected ({expected_n:,}): {rows_ok}")
     print(f"  FPS > 50: {fps_ok}")
     print(f"  chunked transport observed: {chunks_observed} (chunks={r.get('final_n_chunks')})")
     print(f"  finalize banner observed: {done_ok}")
+    print(f"  progressive renders > 1: {progressive_ok} (count={r.get('progressive_renders')})")
     print(f"  center has density pixels: {center_bright}")
     print(f"  corner is empty: {corner_dark}")
 
-    ok = mode_ok and rows_ok and fps_ok and chunks_observed and done_ok and center_bright and corner_dark
+    ok = mode_ok and rows_ok and fps_ok and chunks_observed and done_ok and progressive_ok and center_bright and corner_dark
     return 0 if ok else 1
 
 
